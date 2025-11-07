@@ -1094,6 +1094,28 @@
   max => 'MAX_BACKENDS',
 },
 
+{ name => 'enable_connection_pool', type => 'bool', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_SETTINGS',
+  short_desc => 'Enables the built-in connection pool.',
+  variable => 'enable_connection_pool',
+  boot_val => 'false',
+},
+
+{ name => 'connection_pool_size', type => 'int', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_SETTINGS',
+  short_desc => 'Sets the maximum number of backend processes in the connection pool.',
+  variable => 'connection_pool_size',
+  boot_val => '10',
+  min => '1',
+  max => 'MAX_BACKENDS',
+},
+
+{ name => 'connection_pool_idle_timeout', type => 'int', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_SETTINGS',
+  short_desc => 'Sets the idle timeout in seconds for backend processes in the connection pool.',
+  variable => 'connection_pool_idle_timeout',
+  boot_val => '300',
+  min => '0',
+  max => 'INT_MAX',
+},
+
 { name => 'min_dynamic_shared_memory', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',
   short_desc => 'Amount of dynamic shared memory reserved at startup.',
   flags => 'GUC_UNIT_MB',

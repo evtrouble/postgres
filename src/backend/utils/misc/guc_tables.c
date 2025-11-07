@@ -528,6 +528,11 @@ char	   *event_source;
 bool		row_security;
 bool		check_function_bodies = true;
 
+/* Connection pool parameters */
+bool		enable_connection_pool = false;
+int			connection_pool_size = 10;
+int			connection_pool_idle_timeout = 300;	/* seconds */
+
 /*
  * This GUC exists solely for backward compatibility, check its definition for
  * details.
