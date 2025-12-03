@@ -52,6 +52,7 @@ struct Port *MyProcPort;
 uint8		MyCancelKey[MAX_CANCEL_KEY_LENGTH];
 int			MyCancelKeyLength = 0;
 int			MyPMChildSlot;
+uintptr_t	MyPMChildPtr = 0;  /* PMChild* for connection pool (as address value) */
 
 /*
  * MyLatch points to the latch that should be used for signal handling by the

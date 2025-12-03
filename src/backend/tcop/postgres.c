@@ -72,7 +72,12 @@
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
+#include "postmaster/connection_pool.h"
+#include "utils/guc.h"
 #include "utils/guc_hooks.h"
+
+/* GUC variables */
+extern bool enable_connection_pool;
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -5007,8 +5012,93 @@ PostgresMain(const char *dbname, const char *username)
 				 * on_proc_exit or on_shmem_exit callback, instead. Otherwise
 				 * it will fail to be called during other backend-shutdown
 				 * scenarios.
+				 * If connection pool is enabled and we have a valid PMChild pointer,
+				 * enqueue ourselves to the pool and wait for reuse instead of exiting.
 				 */
-				proc_exit(0);
+				if (enable_connection_pool && MyPMChildPtr != 0)
+				{
+					/*
+					 * Clean up current connection state before returning to pool.
+					 * This includes aborting any active transaction and resetting
+					 * connection-related state.
+					 */
+					if (IsTransactionOrTransactionBlock())
+						AbortCurrentTransaction();
+
+					/* Reset connection state */
+					pq_comm_reset();
+					MemoryContextSwitchTo(TopMemoryContext);
+					
+					/* Disable all timeouts */
+					disable_all_timeouts(false);
+					QueryCancelPending = false;
+					idle_in_transaction_timeout_enabled = false;
+					idle_session_timeout_enabled = false;
+					
+					/* Reset process state */
+					DoingCommandRead = false;
+					debug_query_string = NULL;
+					
+					/* Enqueue ourselves to the connection pool */
+					if (PoolEnqueuePMChild(MyPMChildPtr))
+					{
+						elog(DEBUG2, "backend (pid=%d) returned to connection pool%s, waiting for reuse",
+							 (int) MyProcPid,
+							 (firstchar == EOF) ? " after EOF" : "");
+						
+						/*
+						 * Wait for postmaster to assign a new connection.
+						 * We'll wait until we receive SIGTERM (to exit) or until
+						 * postmaster assigns us a new connection (which would require
+						 * additional IPC mechanism - for now we just wait).
+						 * 
+						 * Note: This is a simplified implementation. A full implementation
+						 * would require postmaster to signal this backend when a new
+						 * connection is available, or use a different IPC mechanism.
+						 * For now, we wait in a loop checking for SIGTERM.
+						 */
+						for (;;)
+						{
+							CHECK_FOR_INTERRUPTS();
+							
+							/* Check if we should exit (SIGTERM received) */
+							if (ProcDiePending)
+							{
+								elog(DEBUG2, "backend (pid=%d) received exit signal, terminating",
+									 (int) MyProcPid);
+								proc_exit(0);
+							}
+							
+							/*
+							 * Wait on latch with timeout. This allows us to:
+							 * 1. Be woken up immediately if postmaster sets our latch
+							 * 2. Check for ProcDiePending periodically (via timeout)
+							 * 3. Exit if postmaster dies
+							 */
+							(void) WaitLatch(MyLatch,
+											  WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
+											  1000, /* 1 second timeout */
+											  0); /* wait_event_info: not tracked */
+							
+							ResetLatch(MyLatch);
+						}
+					}
+					else
+					{
+						/* Failed to enqueue, exit normally */
+						elog(DEBUG2, "backend (pid=%d) failed to return to pool, exiting",
+							 (int) MyProcPid);
+						proc_exit(0);
+					}
+				}
+				else
+				{
+					/*
+					 * Connection pool not enabled or no valid PMChild pointer.
+					 * Exit normally.
+					 */
+					proc_exit(0);
+				}
 
 			case PqMsg_CopyData:
 			case PqMsg_CopyDone:

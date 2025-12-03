@@ -22,6 +22,7 @@ OBJS = \
 	fork_process.o \
 	interrupt.o \
 	launch_backend.o \
+	lockfree_slot_queue.o \
 	pgarch.o \
 	pmchild.o \
 	postmaster.o \

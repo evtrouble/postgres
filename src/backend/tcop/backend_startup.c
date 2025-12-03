@@ -106,6 +106,9 @@ BackendMain(const void *startup_data, size_t startup_data_len)
 #endif
 #endif
 
+	/* Save PMChild pointer for connection pool (if provided) */
+	MyPMChildPtr = bsdata->pmchild_ptr;
+
 	/* Perform additional initialization and collect startup packet */
 	BackendInitialize(MyClientSocket, bsdata->canAcceptConnections);
 

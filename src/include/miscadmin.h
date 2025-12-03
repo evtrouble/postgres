@@ -194,6 +194,7 @@ extern PGDLLIMPORT struct Latch *MyLatch;
 extern PGDLLIMPORT uint8 MyCancelKey[];
 extern PGDLLIMPORT int MyCancelKeyLength;
 extern PGDLLIMPORT int MyPMChildSlot;
+extern PGDLLIMPORT uintptr_t MyPMChildPtr;  /* PMChild* for connection pool (as address value) */
 
 extern PGDLLIMPORT char OutputFileName[];
 extern PGDLLIMPORT char my_exec_path[];

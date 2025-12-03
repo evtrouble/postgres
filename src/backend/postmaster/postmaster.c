@@ -102,6 +102,7 @@
 #include "port/pg_bswap.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
+#include "postmaster/connection_pool.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -228,6 +229,11 @@ char	   *ListenAddresses;
  */
 int			SuperuserReservedConnections;
 int			ReservedConnections;
+
+/* Connection pool GUC variables (defined in guc_tables.c) */
+extern bool enable_connection_pool;
+extern int	connection_pool_size;
+extern int	connection_pool_idle_timeout;
 
 /* The socket(s) we're listening to. */
 #define MAXLISTEN	64
@@ -952,6 +958,17 @@ PostmasterMain(int argc, char *argv[])
 	 */
 	InitializeMaxBackends();
 	InitPostmasterChildSlots();
+
+	/*
+	 * Initialize connection pool if enabled.
+	 */
+	if (enable_connection_pool)
+	{
+		InitConnectionPool();
+		ConfigureConnectionPool();
+		elog(LOG, "connection pool enabled (size=%d, idle_timeout=%d)",
+			 connection_pool_size, connection_pool_idle_timeout);
+	}
 
 	/*
 	 * Calculate the size of the PGPROC fast-path lock arrays.
@@ -1710,7 +1727,32 @@ ServerLoop(void)
 				ClientSocket s;
 
 				if (AcceptConnection(events[i].fd, &s) == STATUS_OK)
+				{
+					/*
+					 * If connection pool is enabled, try to get an idle backend
+					 * from the pool first. If no idle backend is available,
+					 * create a new one.
+					 */
+					if (enable_connection_pool)
+					{
+						PMChild *idle_backend = PoolGetIdleBackend();
+						
+						if (idle_backend != NULL)
+						{
+							/*
+							 * TODO: Implement connection assignment to idle backend.
+							 * For now, we'll create a new backend and note that
+							 * connection pooling is not fully functional yet.
+							 */
+							elog(DEBUG2, "got idle backend from pool (pid=%d), but connection assignment not implemented yet, creating new backend",
+								 (int) idle_backend->pid);
+							/* Fall through to create new backend for now */
+						}
+					}
+					
+					/* Create new backend (or reuse if pool assignment was successful) */
 					BackendStartup(&s);
+				}
 
 				/* We no longer need the open socket in this process */
 				if (s.sock != PGINVALID_SOCKET)
@@ -1733,6 +1775,15 @@ ServerLoop(void)
 			avlauncher_needs_signal = false;
 			if (AutoVacLauncherPMChild != NULL)
 				signal_child(AutoVacLauncherPMChild, SIGUSR2);
+		}
+
+		/*
+		 * Clean up expired backends from connection pool if enabled.
+		 * Do this periodically (every loop iteration is fine, cleanup is cheap).
+		 */
+		if (enable_connection_pool)
+		{
+			PoolCleanupExpired();
 		}
 
 #ifdef HAVE_PTHREAD_IS_THREADED_NP
@@ -2631,6 +2682,34 @@ CleanupBackend(PMChild *bp,
 	bp_bgworker_notify = bp->bgworker_notify;
 	bp_bkend_type = bp->bkend_type;
 	rw = bp->rw;
+	
+	/*
+	 * If connection pool is enabled and this is a normal backend that exited
+	 * cleanly, try to add it to the pool for reuse.
+	 * Note: We do this BEFORE releasing the slot, so we still have the PMChild
+	 * pointer. However, we only add to pool if it's a regular backend (not
+	 * background worker, not crashed).
+	 */
+	if (enable_connection_pool && 
+		!crashed && 
+		bp_bkend_type == B_BACKEND &&
+		EXIT_STATUS_0(exitstatus))
+	{
+		/*
+		 * TODO: For now, we don't add to pool because:
+		 * 1. The backend process has already exited, so we can't reuse it
+		 * 2. We need to implement a mechanism to keep backends alive and
+		 *    mark them as idle instead of exiting
+		 * 
+		 * This will require changes to the backend process lifecycle:
+		 * - Backends should notify postmaster when they become idle
+		 * - Postmaster should keep idle backends alive
+		 * - Only terminate backends when pool is full or timeout expires
+		 */
+		elog(DEBUG2, "backend (pid=%d) exited cleanly, but connection pool reuse not yet implemented",
+			 (int) bp_pid);
+	}
+	
 	if (!ReleasePostmasterChildSlot(bp))
 	{
 		/*
@@ -3590,6 +3669,13 @@ BackendStartup(ClientSocket *client_sock)
 
 	/* Pass down canAcceptConnections state */
 	startup_data.canAcceptConnections = cac;
+	
+	/* Pass PMChild* pointer to backend for connection pool (as uintptr_t) */
+	if (enable_connection_pool && bn != NULL && bn->child_slot > 0)
+		startup_data.pmchild_ptr = (uintptr_t) bn;
+	else
+		startup_data.pmchild_ptr = 0;
+	
 	bn->rw = NULL;
 
 	/* Hasn't asked to be notified about any bgworkers yet */

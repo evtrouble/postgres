@@ -133,6 +133,7 @@ typedef struct
 	char		pkglib_path[MAXPGPATH];
 
 	int			MyPMChildSlot;
+	uintptr_t	MyPMChildPtr;  /* PMChild* for connection pool (as address value) */
 
 	/*
 	 * These are only used by backend processes, but are here because passing
@@ -256,6 +257,7 @@ postmaster_child_launch(BackendType child_type, int child_slot,
 		MemoryContextSwitchTo(TopMemoryContext);
 
 		MyPMChildSlot = child_slot;
+		MyPMChildPtr = 0;  /* Will be set from BackendStartupData */
 		if (client_sock)
 		{
 			MyClientSocket = palloc(sizeof(ClientSocket));

@@ -57,6 +57,14 @@ typedef struct BackendStartupData
 	 * connections.
 	 */
 	TimestampTz fork_started;
+
+	/*
+	 * PMChild pointer (as uintptr_t) for connection pool.
+	 * Backend processes only store this value, never use it.
+	 * Postmaster uses it when dequeuing from the pool.
+	 * Only valid if connection pool is enabled.
+	 */
+	uintptr_t	pmchild_ptr;
 } BackendStartupData;
 
 /*
