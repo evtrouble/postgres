@@ -30,6 +30,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/connection_pool.h"
 #include "postmaster/walsummarizer.h"
 #include "replication/logicallauncher.h"
 #include "replication/origin.h"
@@ -56,6 +57,9 @@
 int			shared_memory_type = DEFAULT_SHARED_MEMORY_TYPE;
 
 shmem_startup_hook_type shmem_startup_hook = NULL;
+
+/* Connection pool GUC (defined in guc_tables.c) */
+extern bool enable_connection_pool;
 
 static Size total_addin_request = 0;
 
@@ -136,6 +140,9 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, CheckpointerShmemSize());
 	size = add_size(size, AutoVacuumShmemSize());
 	size = add_size(size, ReplicationSlotsShmemSize());
+	/* Connection pool shared memory (if enabled) */
+	if (enable_connection_pool)
+		size = add_size(size, ConnectionPoolShmemSize());
 	size = add_size(size, ReplicationOriginShmemSize());
 	size = add_size(size, WalSndShmemSize());
 	size = add_size(size, WalRcvShmemSize());
@@ -325,6 +332,9 @@ CreateOrAttachShmemStructs(void)
 	CheckpointerShmemInit();
 	AutoVacuumShmemInit();
 	ReplicationSlotsShmemInit();
+	/* Connection pool shared memory (if enabled) */
+	if (enable_connection_pool)
+		ConnectionPoolShmemInit();
 	ReplicationOriginShmemInit();
 	WalSndShmemInit();
 	WalRcvShmemInit();

@@ -1,59 +1,44 @@
 /*-------------------------------------------------------------------------
  *
  * connection_pool.c
- *	  Basic connection pool implementation for PostgreSQL
+ *	  Lock-free connection pool implementation for PostgreSQL
  *
- * This file implements a simple connection pool that manages backend
- * processes for reuse. The pool maintains a list of idle backends that
- * can be reused for new client connections.
+ * This file implements a lock-free connection pool that manages backend
+ * processes for reuse. The pool uses a lock-free queue stored in shared
+ * memory to coordinate between multiple backend processes (producers) and
+ * the postmaster's accept loop (single consumer).
  *
  * DESIGN NOTES:
  * =============
  *
- * 1. Pool Structure:
- *    - We maintain a list of idle backends (backends not currently
- *      serving a client)
- *    - Each backend can be in one of three states:
- *      * IDLE: Available for reuse
- *      * BUSY: Currently serving a client
- *      * EXPIRED: Idle for too long, should be terminated
+ * 1. Lock-Free Queue Design:
+ *    - Queue stores PMChild* pointers (as uintptr_t address values)
+ *    - PMChild structures are allocated in postmaster process
+ *    - Backend processes receive PMChild* at startup and store it as uintptr_t
+ *    - Multiple backend processes (producers) enqueue their PMChild* when
+ *      they finish serving a client
+ *    - Single consumer (postmaster accept loop) dequeues PMChild* directly,
+ *      no lookup needed
  *
- * 2. Key Operations:
- *    - acquire_backend(): Get an idle backend from the pool, or create
- *      a new one if pool is empty
- *    - release_backend(): Return a backend to the pool when it finishes
- *      serving a client
- *    - cleanup_expired(): Remove backends that have been idle too long
+ * 2. Concurrency Model:
+ *    - Multiple Producers: Backend processes enqueue PMChild* atomically
+ *    - Single Consumer: Postmaster accept loop dequeues PMChild*
+ *    - Uses atomic operations (pg_atomic_*) for lock-free synchronization
+ *    - Queue is implemented as a circular buffer in shared memory
  *
- * 3. Thread Safety and Concurrency:
- *    
- *    WHY NO LOCKS ARE NEEDED:
- *    ========================
- *    - PostgreSQL postmaster is SINGLE-THREADED by design
- *    - All connection pool operations happen in ServerLoop(), which is a
- *      single-threaded event loop
- *    - Operations are serialized: one connection at a time is processed
- *    - Backend processes are separate processes (not threads), they don't
- *      directly access the connection pool data structures
- *    
- *    CONCURRENCY MODEL:
- *    ==================
- *    - Postmaster thread: All pool operations (add/get/remove) happen here
- *    - Backend processes: Independent processes, communicate via signals/
- *      shared memory, don't touch pool structures directly
- *    - Signal handlers: Use volatile flags, actual work done in ServerLoop
- *    
- *    WHEN LOCKS MIGHT BE NEEDED (FUTURE):
- *    =====================================
- *    - If we add async I/O operations
- *    - If we add background threads for pool maintenance
- *    - If we allow direct pool access from backend processes
- *    - In these cases, we'd need LWLock or similar synchronization
+ * 3. Pool Sizing:
+ *    - Pool can be shrunk: expired backends are removed by PoolCleanupExpired()
+ *      which peeks the queue head, accumulates timeout counts, and removes
+ *      backends after multiple consecutive timeout checks
+ *    - Queue capacity equals MaxBackends, fixed at startup
+ *    - NOTE: MaxConnections cannot be increased dynamically (PGC_POSTMASTER)
+ *      - Increasing MaxConnections requires a server restart
  *
  * 4. Integration Points:
- *    - Will be called from ServerLoop() when a new connection arrives
- *    - Will interact with PMChild structures to track backend state
- *    - Will use postmaster_child_launch() to create new backends
+ *    - Backend processes receive PMChild* in BackendStartupData at startup
+ *    - Backend processes call PoolEnqueuePMChild() when finishing a connection
+ *    - Postmaster calls PoolGetIdleBackend() in ServerLoop() to get idle backends
+ *    - No lookup needed: PMChild* is returned directly from queue
  *
  * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -66,233 +51,358 @@
 
 #include "postgres.h"
 
+#include <signal.h>
+
 #include "postmaster/connection_pool.h"
-#include "postmaster/postmaster.h"
+#include "postmaster/lockfree_slot_queue.h"
+#include "replication/walsender.h"
+#include "storage/ipc.h"
+#include "storage/shmem.h"
+#include "port/atomics.h"
 #include "utils/timestamp.h"
+#include "miscadmin.h"
 
 /*
- * Connection pool state
- *
- * NOTE ON THREAD SAFETY:
- * ======================
- * These variables are accessed ONLY from the postmaster's main thread
- * (ServerLoop). PostgreSQL postmaster is single-threaded by design:
- *
- * 1. All operations are serialized in ServerLoop() event loop
- * 2. Backend processes are separate processes (forked), not threads
- * 3. Signal handlers only set volatile flags; actual work is done in ServerLoop
- * 4. No concurrent access = no locks needed
- *
- * If we ever need to support:
- * - Async I/O operations
- * - Background maintenance threads
- * - Direct pool access from backend processes
- * Then we would need to add LWLock or similar synchronization.
+ * Connection pool shared memory structure
  */
-static dlist_head	IdleBackendList;	/* List of idle backends */
-static int			PoolSize = 0;		/* Current number of backends in pool */
-static int			MaxPoolSize = 10;	/* Maximum pool size (from GUC) */
-static int			IdleTimeout = 300;	/* Idle timeout in seconds (from GUC) */
-
-/*
- * Backend state in the connection pool
- */
-typedef enum
+typedef struct ConnectionPoolShmem
 {
-	POOL_BACKEND_IDLE,		/* Available for reuse */
-	POOL_BACKEND_BUSY,		/* Currently serving a client */
-	POOL_BACKEND_EXPIRED	/* Idle too long, should be terminated */
-} PoolBackendState;
+	LockFreeSlotQueue *queue;		/* Lock-free queue for slot entries */
+	int			max_pool_size;		/* Maximum pool size (from GUC) */
+	int			current_pool_size;	/* Current number of backends in pool */
+	int			idle_timeout;		/* Idle timeout in seconds (from GUC) */
+} ConnectionPoolShmem;
+
+/* Pointer to shared memory structure */
+static ConnectionPoolShmem *pool_shmem = NULL;
+
+/* Timeout tracking for dynamic pool shrinking (postmaster process only, not shared) */
+static int timeout_count = 0;				/* Consecutive timeout checks for queue head */
+
+/* GUC variables - accessed directly */
+extern int connection_pool_size;
+extern int connection_pool_idle_timeout;
 
 /*
- * Extended backend information for connection pool
+ * Calculate shared memory size needed for connection pool
+ *
+ * NOTE: Queue capacity equals MaxBackends
  */
-typedef struct PoolBackend
+Size
+ConnectionPoolShmemSize(void)
 {
-	PMChild	   *pmchild;			/* Pointer to PMChild structure */
-	PoolBackendState state;			/* Current state */
-	TimestampTz idle_since;			/* When this backend became idle */
-	dlist_node	elem;				/* List link in IdleBackendList */
-} PoolBackend;
+	Size		size;
+	Size		queue_size;
+	uint32		queue_capacity;
+	
+	/* Size of ConnectionPoolShmem structure */
+	size = sizeof(ConnectionPoolShmem);
+	
+	/* Queue capacity equals MaxBackends
+	 * MaxBackends should be initialized by InitializeMaxBackends() before
+	 * this function is called.
+	 */
+	if (MaxBackends <= 0)
+		elog(ERROR, "MaxBackends not initialized");
+	
+	/* Use MaxBackends directly as queue capacity */
+	queue_capacity = (uint32) MaxBackends;
+	
+	/* Size of LockFreeSlotQueue structure */
+	queue_size = sizeof(LockFreeSlotQueue);
+	size = add_size(size, queue_size);
+	
+	/* Size of queue entries array */
+	queue_size = queue_capacity * sizeof(PoolSlotEntry);
+	size = add_size(size, queue_size);
+	
+	return size;
+}
 
 /*
- * Initialize the connection pool
+ * Initialize connection pool shared memory
+ */
+void
+ConnectionPoolShmemInit(void)
+{
+	bool		found;
+	bool		queue_found;
+	bool		entries_found;
+	Size		queue_size;
+	Size		entries_size;
+	uint32		queue_capacity;
+	
+	/* Allocate shared memory structure */
+	pool_shmem = (ConnectionPoolShmem *)
+		ShmemInitStruct("Connection Pool", sizeof(ConnectionPoolShmem), &found);
+	
+	if (!found)
+	{
+		/* First time initialization */
+		pool_shmem->max_pool_size = connection_pool_size;
+		pool_shmem->current_pool_size = 0;
+		pool_shmem->idle_timeout = connection_pool_idle_timeout;
+	}
+	
+	/* Calculate queue capacity using the same formula as ConnectionPoolShmemSize()
+	 * This ensures consistency between size calculation and initialization
+	 * Queue capacity equals MaxBackends
+	 */
+	if (MaxBackends <= 0)
+		elog(ERROR, "MaxBackends not initialized");
+	
+	/* Use MaxBackends directly as queue capacity */
+	queue_capacity = (uint32) MaxBackends;
+	
+	/* Allocate queue structure in shared memory */
+	queue_size = sizeof(LockFreeSlotQueue);
+	pool_shmem->queue = (LockFreeSlotQueue *)
+		ShmemInitStruct("Connection Pool Queue", queue_size, &queue_found);
+	
+	/* Allocate queue entries array in shared memory */
+	{
+		PoolSlotEntry *queue_entries;
+		
+		entries_size = queue_capacity * sizeof(PoolSlotEntry);
+		queue_entries = (PoolSlotEntry *)
+			ShmemInitStruct("Connection Pool Queue Entries", entries_size, &entries_found);
+		
+		if (!queue_found && !entries_found)
+		{
+			/* Initialize queue */
+			if (!LockFreeSlotQueueInit(pool_shmem->queue, queue_capacity, queue_entries))
+			{
+				elog(ERROR, "failed to initialize connection pool queue");
+			}
+		}
+		else
+		{
+			/* Queue already exists, verify capacity matches */
+			if (pool_shmem->queue->capacity != queue_capacity)
+				elog(WARNING, "connection pool queue capacity mismatch: expected %u, got %u",
+					 queue_capacity, pool_shmem->queue->capacity);
+		}
+	}
+}
+
+/*
+ * Initialize the connection pool (called from postmaster)
  */
 void
 InitConnectionPool(void)
 {
-	dlist_init(&IdleBackendList);
-	PoolSize = 0;
+	/* Shared memory should already be initialized */
+	if (pool_shmem == NULL)
+		elog(ERROR, "connection pool shared memory not initialized");
 	
 	elog(DEBUG1, "connection pool initialized (max_size=%d, idle_timeout=%d)",
-		 MaxPoolSize, IdleTimeout);
+		 pool_shmem->max_pool_size, pool_shmem->idle_timeout);
 }
 
 /*
  * Set pool configuration from GUC variables
+ * Called when GUC variables are reloaded (SIGHUP)
  */
 void
-ConfigureConnectionPool(int max_size, int idle_timeout)
+ConfigureConnectionPool(void)
 {
-	MaxPoolSize = max_size;
-	IdleTimeout = idle_timeout;
+	/* Update shared memory with current GUC values */
+	if (pool_shmem != NULL)
+	{
+		pool_shmem->max_pool_size = connection_pool_size;
+		pool_shmem->idle_timeout = connection_pool_idle_timeout;
+	}
 	
 	elog(DEBUG1, "connection pool configured (max_size=%d, idle_timeout=%d)",
-		 MaxPoolSize, IdleTimeout);
+		 connection_pool_size, connection_pool_idle_timeout);
+}
+
+
+/*
+ * Enqueue PMChild pointer to the lock-free queue
+ *
+ * This is called by backend processes when they finish serving a client
+ * and want to return to the pool. This is the producer side (multiple
+ * backends can call this concurrently).
+ *
+ * 'pmchild_ptr' is the PMChild* pointer passed from postmaster at startup,
+ * stored as uintptr_t (address value). Backend processes only store this
+ * value, never use it.
+ *
+ * Returns true if successfully enqueued, false if queue is full or
+ * pmchild_ptr is invalid (0).
+ * 
+ * Note: max_pool_size check is done in PoolGetIdleBackend() when postmaster
+ * dequeues, because backend processes cannot access PMChild* in postmaster's
+ * private memory.
+ *
+ * THREAD SAFETY: Lock-free, can be called from multiple backend processes
+ */
+bool
+PoolEnqueuePMChild(uintptr_t pmchild_ptr)
+{
+	TimestampTz idle_since;
+	
+	if (pool_shmem == NULL || pool_shmem->queue == NULL)
+		return false;
+	
+	if (pmchild_ptr == 0)
+		return false;
+	
+	/* Get current timestamp when backend becomes idle */
+	idle_since = GetCurrentTimestamp();
+	
+	/* Use the lock-free queue API */
+	return LockFreeSlotQueueEnqueue(pool_shmem->queue,
+									pmchild_ptr,
+									idle_since,
+									pool_shmem->max_pool_size);
 }
 
 /*
- * Add a backend to the idle pool
+ * Add a backend to the idle pool (wrapper for compatibility)
  *
- * This is called when a backend finishes serving a client and becomes
- * available for reuse.
- *
- * THREAD SAFETY: Called only from postmaster's main thread (ServerLoop),
- * no locking needed.
+ * This is a wrapper that converts PMChild* to uintptr_t and calls
+ * PoolEnqueuePMChild(). Can be called from postmaster or backend.
  */
 void
 PoolAddBackend(PMChild *pmchild)
 {
-	PoolBackend *pool_backend;
-	
-	/* Check if pool is full */
-	if (PoolSize >= MaxPoolSize)
-	{
-		elog(DEBUG2, "connection pool is full (%d/%d), not adding backend",
-			 PoolSize, MaxPoolSize);
+	if (pmchild == NULL || pmchild->child_slot <= 0)
 		return;
+	
+	if (PoolEnqueuePMChild((uintptr_t) pmchild))
+	{
+		elog(DEBUG2, "added backend (pid=%d, slot=%d) to connection pool",
+			 (int) pmchild->pid, pmchild->child_slot);
+	}
+}
+
+/*
+ * Signal a backend process to exit gracefully
+ *
+ * This is a helper function to send SIGTERM to a backend process.
+ * Called from postmaster context, so we can use kill() directly.
+ */
+static void
+SignalBackendToExit(PMChild *pmchild)
+{
+	if (pmchild == NULL || pmchild->pid == 0)
+		return;
+	
+	elog(DEBUG2, "sending SIGTERM to backend (pid=%d, slot=%d) to exit",
+		 (int) pmchild->pid, pmchild->child_slot);
+	
+	if (kill(pmchild->pid, SIGTERM) < 0)
+	{
+		/* Process may have already exited */
+		elog(DEBUG3, "kill(%d, SIGTERM) failed: %m", (int) pmchild->pid);
 	}
 	
-	/* Allocate pool backend structure */
-	pool_backend = (PoolBackend *) palloc(sizeof(PoolBackend));
-	pool_backend->pmchild = pmchild;
-	pool_backend->state = POOL_BACKEND_IDLE;
-	pool_backend->idle_since = GetCurrentTimestamp();
-	
-	/* Add to idle list */
-	dlist_push_head(&IdleBackendList, &pool_backend->elem);
-	PoolSize++;
-	
-	elog(DEBUG2, "added backend (pid=%d) to connection pool (size=%d/%d)",
-		 (int) pmchild->pid, PoolSize, MaxPoolSize);
+#ifdef HAVE_SETSID
+	/* Also signal the process group if supported */
+	if (kill(-pmchild->pid, SIGTERM) < 0)
+		elog(DEBUG3, "kill(%d, SIGTERM) failed: %m", (int) -pmchild->pid);
+#endif
 }
 
 /*
  * Get an idle backend from the pool
  *
  * Returns NULL if no idle backend is available.
+ * Simply dequeues from the queue - expired backends are handled by
+ * PoolCleanupExpired() which is called periodically.
  *
- * THREAD SAFETY: Called only from postmaster's main thread (ServerLoop),
- * no locking needed.
+ * THREAD SAFETY: Called only from postmaster's main thread (ServerLoop).
  */
 PMChild *
 PoolGetIdleBackend(void)
 {
-	PoolBackend *pool_backend;
-	PMChild	   *pmchild;
-	
-	/* Check if pool is empty */
-	if (dlist_is_empty(&IdleBackendList))
-	{
-		elog(DEBUG2, "connection pool is empty");
+	if (pool_shmem == NULL || pool_shmem->queue == NULL)
 		return NULL;
-	}
 	
-	/* Get the first idle backend */
-	pool_backend = dlist_container(PoolBackend, elem,
-								   dlist_pop_head_node(&IdleBackendList));
-	pmchild = pool_backend->pmchild;
-	pool_backend->state = POOL_BACKEND_BUSY;
-	PoolSize--;
-	
-	elog(DEBUG2, "acquired backend (pid=%d) from connection pool (size=%d/%d)",
-		 (int) pmchild->pid, PoolSize, MaxPoolSize);
-	
-	/* Free the pool backend structure */
-	pfree(pool_backend);
-	
-	return pmchild;
+	/* Simply dequeue from the queue */
+	return LockFreeSlotQueueDequeue(pool_shmem->queue, NULL);
 }
 
 /*
- * Remove a backend from the pool
+ * Clean up expired backends from the pool (dynamic pool shrinking)
  *
- * This is called when a backend exits or needs to be removed.
- */
-void
-PoolRemoveBackend(PMChild *pmchild)
-{
-	dlist_iter	iter;
-	PoolBackend *pool_backend;
-	bool		found = false;
-	
-	/* Search for the backend in the idle list */
-	dlist_foreach(iter, &IdleBackendList)
-	{
-		pool_backend = dlist_container(PoolBackend, elem, iter.cur);
-		if (pool_backend->pmchild == pmchild)
-		{
-			dlist_delete(&pool_backend->elem);
-			PoolSize--;
-			found = true;
-			pfree(pool_backend);
-			break;
-		}
-	}
-	
-	if (found)
-	{
-		elog(DEBUG2, "removed backend (pid=%d) from connection pool (size=%d/%d)",
-			 (int) pmchild->pid, PoolSize, MaxPoolSize);
-	}
-}
-
-/*
- * Clean up expired backends from the pool
+ * This function is called periodically from the accept loop (ServerLoop).
+ * It peeks at the first entry in the queue, checks if it's expired,
+ * and accumulates timeout counts. When a backend has been expired
+ * for multiple consecutive checks, it is dequeued, signaled to exit,
+ * and removed from ActiveChildList.
  *
- * This should be called periodically to remove backends that have been
- * idle for too long.
+ * This enables dynamic pool shrinking: expired backends are gradually
+ * removed from the pool, allowing the pool size to shrink naturally.
  */
 void
 PoolCleanupExpired(void)
 {
-	dlist_mutable_iter iter;
-	PoolBackend *pool_backend;
 	TimestampTz now;
-	int			expired_count = 0;
+	TimestampTz idle_since;
+	PMChild    *pmchild;
+	const int	timeout_threshold = 3; /* Remove after 3 consecutive timeout checks */
 	
-	if (dlist_is_empty(&IdleBackendList))
+	if (pool_shmem == NULL || pool_shmem->queue == NULL)
 		return;
+	
+	if (pool_shmem->idle_timeout <= 0)
+		return; /* Timeout disabled */
 	
 	now = GetCurrentTimestamp();
 	
-	/* Iterate through idle backends and remove expired ones */
-	dlist_foreach_modify(iter, &IdleBackendList)
+	/* Peek at the first entry in the queue (without dequeuing) */
+	pmchild = LockFreeSlotQueuePeek(pool_shmem->queue, &idle_since);
+	if (pmchild == NULL)
 	{
-		pool_backend = dlist_container(PoolBackend, elem, iter.cur);
-		
-		/* Check if backend has been idle too long */
-		if (TimestampDifferenceExceedsSeconds(pool_backend->idle_since, now,
-											   IdleTimeout))
-		{
-			elog(DEBUG2, "removing expired backend (pid=%d) from pool",
-				 (int) pool_backend->pmchild->pid);
-			
-			dlist_delete(iter.cur);
-			PoolSize--;
-			expired_count++;
-			
-			/* TODO: Actually terminate the backend process */
-			/* For now, just remove from pool */
-			
-			pfree(pool_backend);
-		}
+		/* Queue is empty, reset timeout tracking */
+		timeout_count = 0;
+		return;
 	}
 	
-	if (expired_count > 0)
+	/* Check if this backend has been idle too long */
+	if (idle_since > 0 &&
+		TimestampDifferenceExceedsSeconds(idle_since, now, pool_shmem->idle_timeout))
 	{
-		elog(DEBUG1, "cleaned up %d expired backend(s) from connection pool",
-			 expired_count);
+		/* Backend is expired, increment timeout counter */
+		timeout_count++;
+		
+		elog(DEBUG2, "backend (pid=%d, slot=%d) expired check #%d (idle %ld seconds)",
+			 (int) pmchild->pid, pmchild->child_slot, timeout_count,
+			 (long) TimestampDifferenceMilliseconds(idle_since, now) / 1000);
+		
+		/* If threshold reached, remove this backend */
+		if (timeout_count >= timeout_threshold)
+		{
+			/* Dequeue the entry (remove from queue) */
+			PMChild *dequeued = LockFreeSlotQueueDequeue(pool_shmem->queue, NULL);
+			
+			/* Verify we got the same backend */
+			if (dequeued == pmchild)
+			{
+				/* Send exit signal to the backend */
+				SignalBackendToExit(pmchild);
+				
+				/* Remove from ActiveChildList and release slot */
+				ReleasePostmasterChildSlot(pmchild);
+				
+				elog(LOG, "removed expired backend (pid=%d, slot=%d) from connection pool "
+					 "(idle %ld seconds, %d consecutive timeout checks)",
+					 (int) pmchild->pid, pmchild->child_slot,
+					 (long) TimestampDifferenceMilliseconds(idle_since, now) / 1000,
+					 timeout_count);
+			}
+			
+			/* Reset timeout tracking */
+			timeout_count = 0;
+		}
+	}
+	else
+	{
+		/* Backend is not expired, reset timeout counter */
+		timeout_count = 0;
 	}
 }
 
@@ -302,8 +412,35 @@ PoolCleanupExpired(void)
 void
 PoolGetStats(int *current_size, int *max_size, int *idle_count)
 {
-	*current_size = PoolSize;
-	*max_size = MaxPoolSize;
-	*idle_count = PoolSize; /* All in pool are idle */
+	LockFreeSlotQueue *queue;
+	uint32		head;
+	uint32		tail;
+	int			count = 0;
+	
+	if (pool_shmem == NULL)
+	{
+		*current_size = 0;
+		*max_size = 0;
+		*idle_count = 0;
+		return;
+	}
+	
+	*max_size = pool_shmem->max_pool_size;
+	
+	/* Count items in queue */
+	if (pool_shmem->queue != NULL)
+	{
+		queue = pool_shmem->queue;
+		head = pg_atomic_read_u32(&queue->head);
+		tail = pg_atomic_read_u32(&queue->tail);
+		
+		if (tail >= head)
+			count = tail - head;
+		else
+			count = queue->capacity - head + tail;
+	}
+	
+	*idle_count = count;
+	*current_size = count; /* Approximate, actual size may vary */
 }
 
