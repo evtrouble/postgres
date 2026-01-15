@@ -15,6 +15,7 @@
 
 #include "lib/ilist.h"
 #include "miscadmin.h"
+#include "storage/latch.h"
 
 /*
  * A struct representing an active postmaster child process.  This is used
@@ -45,6 +46,9 @@ typedef struct
 	struct RegisteredBgWorker *rw;	/* bgworker info, if this is a bgworker */
 	bool		bgworker_notify;	/* gets bgworker start/stop notifications */
 	dlist_node	elem;			/* list link in ActiveChildList */
+	// CONNECTION TODO: 初始化
+	Latch	   *procLatch;		/* pointer to PGPROC->procLatch in shared memory */
+	int         control_fd;
 } PMChild;
 
 #ifdef EXEC_BACKEND

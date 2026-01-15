@@ -55,6 +55,7 @@
 
 #include "postmaster/connection_pool.h"
 #include "postmaster/lockfree_slot_queue.h"
+#include "postmaster/postmaster.h"
 #include "replication/walsender.h"
 #include "storage/ipc.h"
 #include "storage/shmem.h"
@@ -115,7 +116,6 @@ ConnectionPoolShmemSize(void)
 	/* Size of queue entries array */
 	queue_size = queue_capacity * sizeof(PoolSlotEntry);
 	size = add_size(size, queue_size);
-	
 	return size;
 }
 
@@ -443,4 +443,3 @@ PoolGetStats(int *current_size, int *max_size, int *idle_count)
 	*idle_count = count;
 	*current_size = count; /* Approximate, actual size may vary */
 }
-

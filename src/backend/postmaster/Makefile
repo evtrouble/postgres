@@ -23,6 +23,7 @@ OBJS = \
 	interrupt.o \
 	launch_backend.o \
 	lockfree_slot_queue.o \
+	pm_backend_comm.o \
 	pgarch.o \
 	pmchild.o \
 	postmaster.o \

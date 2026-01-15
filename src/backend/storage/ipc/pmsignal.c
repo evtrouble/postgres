@@ -326,6 +326,8 @@ static void
 MarkPostmasterChildInactive(int code, Datum arg)
 {
 	int			slot = MyPMChildSlot;
+	if (is_reuse_cleanup)
+		return;
 
 	Assert(slot > 0 && slot <= PMSignalState->num_child_flags);
 	slot--;

@@ -211,6 +211,9 @@ smgrshutdown(int code, Datum arg)
 {
 	int			i;
 
+	if (is_reuse_cleanup)
+		return;
+
 	HOLD_INTERRUPTS();
 
 	for (i = 0; i < NSmgr; i++)

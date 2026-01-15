@@ -362,6 +362,43 @@ CleanupInvalidationState(int status, Datum arg)
 	LWLockRelease(SInvalWriteLock);
 }
 
+void
+SharedInvalBackendInitForReuse(bool sendOnly)
+{
+	ProcState  *stateP;
+	pid_t		oldPid;
+	SISeg	   *segP = shmInvalBuffer;
+
+	if (MyProcNumber < 0)
+		elog(ERROR, "MyProcNumber not set");
+	if (MyProcNumber >= NumProcStateSlots)
+		elog(PANIC, "unexpected MyProcNumber %d in SharedInvalBackendInitForReuse (max %d)",
+			 MyProcNumber, NumProcStateSlots);
+	stateP = &segP->procState[MyProcNumber];
+
+	LWLockAcquire(SInvalWriteLock, LW_EXCLUSIVE);
+
+	oldPid = stateP->procPid;
+	if (oldPid != 0)
+	{
+		LWLockRelease(SInvalWriteLock);
+		elog(ERROR, "sinval slot for backend %d is already in use by process %d",
+			 MyProcNumber, (int) oldPid);
+	}
+
+	shmInvalBuffer->pgprocnos[shmInvalBuffer->numProcs++] = MyProcNumber;
+
+	nextLocalTransactionId = stateP->nextLXID;
+
+	stateP->procPid = MyProcPid;
+	stateP->nextMsgNum = segP->maxMsgNum;
+	stateP->resetState = false;
+	stateP->signaled = false;
+	stateP->hasMessages = false;
+	stateP->sendOnly = sendOnly;
+
+	LWLockRelease(SInvalWriteLock);
+}
 /*
  * SIInsertDataEntries
  *		Add new invalidation message(s) to the buffer.

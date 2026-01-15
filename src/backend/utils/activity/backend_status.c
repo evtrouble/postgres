@@ -510,6 +510,9 @@ pgstat_beshutdown_hook(int code, Datum arg)
 {
 	volatile PgBackendStatus *beentry = MyBEEntry;
 
+	if (is_reuse_cleanup)
+		return;
+
 	/*
 	 * Clear my status entry, following the protocol of bumping st_changecount
 	 * before and after.  We use a volatile pointer here to ensure the

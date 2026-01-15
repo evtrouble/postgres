@@ -603,6 +603,9 @@ pgstat_before_server_shutdown(int code, Datum arg)
 static void
 pgstat_shutdown_hook(int code, Datum arg)
 {
+	if (is_reuse_cleanup)
+		return;
+
 	Assert(!pgstat_is_shutdown);
 	Assert(IsUnderPostmaster || !IsPostmasterEnvironment);
 

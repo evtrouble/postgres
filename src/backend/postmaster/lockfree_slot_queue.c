@@ -124,6 +124,7 @@ LockFreeSlotQueueDequeue(LockFreeSlotQueue *queue, TimestampTz *idle_since)
     uint32 head, tail;
     uintptr_t pmchild_ptr;
     PMChild *pmchild;
+    TimestampTz enqueue_since;
 
     if (queue == NULL || queue->entries == NULL)
         return NULL;
@@ -141,6 +142,7 @@ LockFreeSlotQueueDequeue(LockFreeSlotQueue *queue, TimestampTz *idle_since)
      */
     pg_read_barrier(); /* acquire semantics */
     pmchild_ptr = queue->entries[head].pmchild_ptr;
+    enqueue_since = queue->entries[head].idle_since;
     
     /* Return timestamp if requested */
     if (idle_since != NULL)
@@ -162,6 +164,6 @@ LockFreeSlotQueueDequeue(LockFreeSlotQueue *queue, TimestampTz *idle_since)
     pmchild = (PMChild *) pmchild_ptr;
 
     elog(DEBUG3, "dequeued PMChild* %p from index %u (idle_since=%ld)",
-         (void *)pmchild_ptr, head, idle_since ? (long) *idle_since : 0);
+         (void *)pmchild_ptr, head, (long) enqueue_since);
     return pmchild;
 }

@@ -66,6 +66,7 @@ extern PGDLLIMPORT bool proc_exit_inprogress;
 extern PGDLLIMPORT bool shmem_exit_inprogress;
 
 pg_noreturn extern void proc_exit(int code);
+extern void ReuseProcExitCleanup(void);
 extern void shmem_exit(int code);
 extern void on_proc_exit(pg_on_exit_callback function, Datum arg);
 extern void on_shmem_exit(pg_on_exit_callback function, Datum arg);

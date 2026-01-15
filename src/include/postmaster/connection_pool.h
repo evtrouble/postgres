@@ -15,6 +15,7 @@
 #define CONNECTION_POOL_H
 
 #include "postmaster/postmaster.h"
+#include "libpq/libpq-be.h"
 
 /* Shared memory functions */
 extern Size ConnectionPoolShmemSize(void);
@@ -30,6 +31,5 @@ extern void PoolGetStats(int *current_size, int *max_size, int *idle_count);
 
 /* Lock-free queue functions (can be called from backend processes) */
 extern bool PoolEnqueuePMChild(uintptr_t pmchild_ptr);
-
 #endif							/* CONNECTION_POOL_H */
 

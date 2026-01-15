@@ -53,6 +53,8 @@ static bool atexit_callback_setup = false;
 /* local functions */
 static void proc_exit_prepare(int code);
 
+extern void RemoveProcFromArray(int code, Datum arg);
+
 
 /* ----------------------------------------------------------------
  *						exit() handling stuff
@@ -156,6 +158,39 @@ proc_exit(int code)
 	exit(code);
 }
 
+void
+ReuseProcExitCleanup(void)
+{
+	if (MyProcPid != (int) getpid())
+		elog(PANIC, "ReuseProcExitCleanup() called in child process");
+
+	is_reuse_cleanup = true;
+
+	proc_exit_inprogress = true;
+
+	InterruptPending = false;
+	ProcDiePending = false;
+	QueryCancelPending = false;
+	InterruptHoldoffCount = 1;
+	CritSectionCount = 0;
+
+	error_context_stack = NULL;
+	debug_query_string = NULL;
+
+	shmem_exit(0); 
+
+	elog(DEBUG3, "ReuseProcExitCleanup: %d callbacks to make", on_proc_exit_index);
+	for (int i = on_proc_exit_index - 1; i >= 0; i--)
+		on_proc_exit_list[i].function(0,
+									  on_proc_exit_list[i].arg);
+	
+	proc_exit_inprogress = false;
+	is_reuse_cleanup = false;
+	InterruptHoldoffCount = 0; 
+
+	elog(DEBUG1, "ReuseProcExitCleanup completed: all proc_exit logic done, process not exited");
+}
+
 /*
  * Code shared between proc_exit and the atexit handler.  Note that in
  * normal exit through proc_exit, this will actually be called twice ...
@@ -229,20 +264,31 @@ shmem_exit(int code)
 {
 	shmem_exit_inprogress = true;
 
-	/*
-	 * Call before_shmem_exit callbacks.
-	 *
-	 * These should be things that need most of the system to still be up and
-	 * working, such as cleanup of temp relations, which requires catalog
-	 * access; or things that need to be completed because later cleanup steps
-	 * depend on them, such as releasing lwlocks.
-	 */
-	elog(DEBUG3, "shmem_exit(%d): %d before_shmem_exit callbacks to make",
-		 code, before_shmem_exit_index);
-	while (--before_shmem_exit_index >= 0)
-		before_shmem_exit_list[before_shmem_exit_index].function(code,
-																 before_shmem_exit_list[before_shmem_exit_index].arg);
-	before_shmem_exit_index = 0;
+	if (is_reuse_cleanup)
+	{
+		elog(DEBUG3, "shmem_exit(%d): %d before_shmem_exit callbacks to make (reuse)",
+			 code, before_shmem_exit_index);
+		for (int i = before_shmem_exit_index - 1; i >= 0; i--)
+			before_shmem_exit_list[i].function(code,
+												before_shmem_exit_list[i].arg);
+	}
+	else
+	{
+		/*
+		 * Call before_shmem_exit callbacks.
+		 *
+		 * These should be things that need most of the system to still be up and
+		 * working, such as cleanup of temp relations, which requires catalog
+		 * access; or things that need to be completed because later cleanup steps
+		 * depend on them, such as releasing lwlocks.
+		 */
+		elog(DEBUG3, "shmem_exit(%d): %d before_shmem_exit callbacks to make",
+			 code, before_shmem_exit_index);
+		while (--before_shmem_exit_index >= 0)
+			before_shmem_exit_list[before_shmem_exit_index].function(code,
+																	 before_shmem_exit_list[before_shmem_exit_index].arg);
+		before_shmem_exit_index = 0;
+	}
 
 	/*
 	 * Call dynamic shared memory callbacks.
@@ -259,8 +305,11 @@ shmem_exit(int code)
 	 * if one dynamic shared memory callback errors out, the remaining
 	 * callbacks will still be invoked.  Thus, hard-coding this call puts it
 	 * equal footing with callbacks for the main shared memory segment.
+	 *
+	 * During ReuseProcExitCleanup(), we want to keep any long-lived dynamic
+	 * shared memory (such as the DSA backing pgstat) attached across
+	 * sessions, so skip shutting down DSM in that case.
 	 */
-	dsm_backend_shutdown();
 
 	/*
 	 * Call on_shmem_exit callbacks.
@@ -270,12 +319,28 @@ shmem_exit(int code)
 	 * callbacks might themselves fail, leading to re-entry to this routine;
 	 * in other cases, it's cleanup that only happens at process exit.
 	 */
-	elog(DEBUG3, "shmem_exit(%d): %d on_shmem_exit callbacks to make",
-		 code, on_shmem_exit_index);
-	while (--on_shmem_exit_index >= 0)
-		on_shmem_exit_list[on_shmem_exit_index].function(code,
-														 on_shmem_exit_list[on_shmem_exit_index].arg);
-	on_shmem_exit_index = 0;
+	if (is_reuse_cleanup)
+	{
+		elog(DEBUG3, "shmem_exit(%d): %d on_shmem_exit callbacks to make (reuse)",
+			 code, on_shmem_exit_index);
+		for (int i = on_shmem_exit_index - 1; i >= 0; i--)
+		{
+			if (on_shmem_exit_list[i].function == RemoveProcFromArray)
+				continue;
+			on_shmem_exit_list[i].function(code,
+										   on_shmem_exit_list[i].arg);
+		}
+	}
+	else
+	{
+		dsm_backend_shutdown();
+		elog(DEBUG3, "shmem_exit(%d): %d on_shmem_exit callbacks to make",
+			 code, on_shmem_exit_index);
+		while (--on_shmem_exit_index >= 0)
+			on_shmem_exit_list[on_shmem_exit_index].function(code,
+															 on_shmem_exit_list[on_shmem_exit_index].arg);
+		on_shmem_exit_index = 0;
+	}
 
 	shmem_exit_inprogress = false;
 }

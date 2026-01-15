@@ -322,6 +322,165 @@ pq_init(ClientSocket *client_sock)
 	return port;
 }
 
+/*
+ * pq_reuse - Reuse an existing Port for a new client connection.
+ *
+ * This function replaces the socket and address info in MyProcPort,
+ * without re-registering exit callbacks or reallocating long-lived resources.
+ */
+void
+pq_reuse(ClientSocket *client_sock)
+{
+	int			socket_pos PG_USED_FOR_ASSERTS_ONLY;
+	int			latch_pos PG_USED_FOR_ASSERTS_ONLY;
+    Assert(MyProcPort != NULL);
+    Assert(client_sock != NULL);
+
+    /* Replace with new socket */
+    MyProcPort->sock = client_sock->sock;
+    /* Update remote address */
+    memcpy(&MyProcPort->raddr.addr, &client_sock->raddr.addr, client_sock->raddr.salen);
+    MyProcPort->raddr.salen = client_sock->raddr.salen;
+
+    /* Re-fetch local address (optional) */
+    MyProcPort->laddr.salen = sizeof(MyProcPort->laddr.addr);
+    if (getsockname(MyProcPort->sock,
+                    (struct sockaddr *) &MyProcPort->laddr.addr,
+                    &MyProcPort->laddr.salen) < 0)
+    {
+        elog(WARNING, "getsockname failed: %m");
+    }
+
+	/* select NODELAY and KEEPALIVE options if it's a TCP connection */
+	if (MyProcPort->laddr.addr.ss_family != AF_UNIX)
+	{
+		int			on;
+#ifdef WIN32
+		int			oldopt;
+		int			optlen;
+		int			newopt;
+#endif
+
+#ifdef	TCP_NODELAY
+		on = 1;
+		if (setsockopt(MyProcPort->sock, IPPROTO_TCP, TCP_NODELAY,
+					   (char *) &on, sizeof(on)) < 0)
+		{
+			ereport(FATAL,
+					(errmsg("%s(%s) failed: %m", "setsockopt", "TCP_NODELAY")));
+		}
+#endif
+		on = 1;
+		if (setsockopt(MyProcPort->sock, SOL_SOCKET, SO_KEEPALIVE,
+					   (char *) &on, sizeof(on)) < 0)
+		{
+			ereport(FATAL,
+					(errmsg("%s(%s) failed: %m", "setsockopt", "SO_KEEPALIVE")));
+		}
+
+#ifdef WIN32
+
+		/*
+		 * This is a Win32 socket optimization.  The OS send buffer should be
+		 * large enough to send the whole Postgres send buffer in one go, or
+		 * performance suffers.  The Postgres send buffer can be enlarged if a
+		 * very large message needs to be sent, but we won't attempt to
+		 * enlarge the OS buffer if that happens, so somewhat arbitrarily
+		 * ensure that the OS buffer is at least PQ_SEND_BUFFER_SIZE * 4.
+		 * (That's 32kB with the current default).
+		 *
+		 * The default OS buffer size used to be 8kB in earlier Windows
+		 * versions, but was raised to 64kB in Windows 2012.  So it shouldn't
+		 * be necessary to change it in later versions anymore.  Changing it
+		 * unnecessarily can even reduce performance, because setting
+		 * SO_SNDBUF in the application disables the "dynamic send buffering"
+		 * feature that was introduced in Windows 7.  So before fiddling with
+		 * SO_SNDBUF, check if the current buffer size is already large enough
+		 * and only increase it if necessary.
+		 *
+		 * See https://support.microsoft.com/kb/823764/EN-US/ and
+		 * https://msdn.microsoft.com/en-us/library/bb736549%28v=vs.85%29.aspx
+		 */
+		optlen = sizeof(oldopt);
+		if (getsockopt(MyProcPort->sock, SOL_SOCKET, SO_SNDBUF, (char *) &oldopt,
+					   &optlen) < 0)
+		{
+			ereport(FATAL,
+					(errmsg("%s(%s) failed: %m", "getsockopt", "SO_SNDBUF")));
+		}
+		newopt = PQ_SEND_BUFFER_SIZE * 4;
+		if (oldopt < newopt)
+		{
+			if (setsockopt(MyProcPort->sock, SOL_SOCKET, SO_SNDBUF, (char *) &newopt,
+						   sizeof(newopt)) < 0)
+			{
+				ereport(FATAL,
+						(errmsg("%s(%s) failed: %m", "setsockopt", "SO_SNDBUF")));
+			}
+		}
+#endif
+
+		/*
+		 * Also apply the current keepalive parameters.  If we fail to set a
+		 * parameter, don't error out, because these aren't universally
+		 * supported.  (Note: you might think we need to reset the GUC
+		 * variables to 0 in such a case, but it's not necessary because the
+		 * show hooks for these variables report the truth anyway.)
+		 */
+		(void) pq_setkeepalivesidle(tcp_keepalives_idle, MyProcPort);
+		(void) pq_setkeepalivesinterval(tcp_keepalives_interval, MyProcPort);
+		(void) pq_setkeepalivescount(tcp_keepalives_count, MyProcPort);
+		(void) pq_settcpusertimeout(tcp_user_timeout, MyProcPort);
+	}
+
+	/* initialize state variables */
+	PqSendBufferSize = PQ_SEND_BUFFER_SIZE;
+	PqSendPointer = PqSendStart = PqRecvPointer = PqRecvLength = 0;
+	FrontendProtocol = 0;
+	pq_comm_reset();
+	PqCommBusy = false;
+	PqCommReadingMsg = false;
+
+	/*
+	 * In backends (as soon as forked) we operate the underlying socket in
+	 * nonblocking mode and use latches to implement blocking semantics if
+	 * needed. That allows us to provide safely interruptible reads and
+	 * writes.
+	 */
+#ifndef WIN32
+	if (!pg_set_noblock(MyProcPort->sock))
+		ereport(FATAL,
+				(errmsg("could not set socket to nonblocking mode: %m")));
+#endif
+
+#ifndef WIN32
+
+	/* Don't give the socket to any subprograms we execute. */
+	if (fcntl(MyProcPort->sock, F_SETFD, FD_CLOEXEC) < 0)
+		elog(FATAL, "fcntl(F_SETFD) failed on socket: %m");
+#endif
+
+    /* Re-add socket to wait event set */
+	if (FeBeWaitSet != NULL)
+    {
+        FreeWaitEventSet(FeBeWaitSet);
+    }
+	FeBeWaitSet = CreateWaitEventSet(NULL, FeBeWaitSetNEvents);
+	socket_pos = AddWaitEventToSet(FeBeWaitSet, WL_SOCKET_WRITEABLE,
+								   MyProcPort->sock, NULL, NULL);
+	latch_pos = AddWaitEventToSet(FeBeWaitSet, WL_LATCH_SET, PGINVALID_SOCKET,
+								  MyLatch, NULL);
+	AddWaitEventToSet(FeBeWaitSet, WL_POSTMASTER_DEATH, PGINVALID_SOCKET,
+					  NULL, NULL);
+
+	/*
+	 * The event positions match the order we added them, but let's sanity
+	 * check them to be sure.
+	 */
+	Assert(socket_pos == FeBeWaitSetSocketPos);
+	Assert(latch_pos == FeBeWaitSetLatchPos);
+}
+
 /* --------------------------------
  *		socket_comm_reset - reset libpq during error recovery
  *
@@ -377,6 +536,13 @@ socket_close(int code, Datum arg)
 		 * call this, so this is safe when interrupting BackendInitialize().
 		 */
 		secure_close(MyProcPort);
+
+		/*
+		 * In connection reuse cleanup, close the kernel socket fd promptly to
+		 * free resources before the backend continues running.
+		 */
+		if (is_reuse_cleanup && MyProcPort->sock != PGINVALID_SOCKET)
+			closesocket(MyProcPort->sock);
 
 		/*
 		 * Formerly we did an explicit close() here, but it seems better to

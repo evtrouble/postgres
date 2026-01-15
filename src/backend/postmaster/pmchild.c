@@ -156,6 +156,8 @@ InitPostmasterChildSlots(void)
 			slots[slotno].bkend_type = B_INVALID;
 			slots[slotno].rw = NULL;
 			slots[slotno].bgworker_notify = false;
+			slots[slotno].procLatch = NULL;
+			slots[slotno].control_fd = -1;
 			dlist_push_tail(&pmchild_pools[btype].freelist, &slots[slotno].elem);
 			slotno++;
 		}
@@ -192,6 +194,7 @@ AssignPostmasterChildSlot(BackendType btype)
 	pmchild->bkend_type = btype;
 	pmchild->rw = NULL;
 	pmchild->bgworker_notify = true;
+	pmchild->procLatch = NULL;	/* Will be set after backend calls InitProcess() */
 
 	/*
 	 * pmchild->child_slot for each entry was initialized when the array of

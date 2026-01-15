@@ -3239,6 +3239,9 @@ AtEOXact_Files(bool isCommit)
 static void
 BeforeShmemExit_Files(int code, Datum arg)
 {
+	if (is_reuse_cleanup)
+		return;
+
 	CleanupTempFiles(false, true);
 
 	/* prevent further temp files from being created */

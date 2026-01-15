@@ -1284,6 +1284,9 @@ pgaio_closing_fd(int fd)
 void
 pgaio_shutdown(int code, Datum arg)
 {
+	if (is_reuse_cleanup)
+		return;
+
 	Assert(pgaio_my_backend);
 	Assert(!pgaio_my_backend->handed_out_io);
 

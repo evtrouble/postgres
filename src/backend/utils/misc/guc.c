@@ -237,6 +237,7 @@ static uint32 guc_name_hash(const void *key, Size keysize);
 static int	guc_name_match(const void *key1, const void *key2, Size keysize);
 static void InitializeGUCOptionsFromEnvironment(void);
 static void InitializeOneGUCOption(struct config_generic *gconf);
+static void ResetGUCReportingInternal(void);
 static void RemoveGUCFromLists(struct config_generic *gconf);
 static void set_guc_source(struct config_generic *gconf, GucSource newsource);
 static void pg_timezone_abbrev_initialize(void);
@@ -2596,8 +2597,36 @@ ReportGUCOption(struct config_generic *record)
 		guc_free(record->last_reported);
 		record->last_reported = guc_strdup(LOG, val);
 	}
+}
 
-	pfree(val);
+static void
+ResetGUCReportingInternal(void)
+{
+	HASH_SEQ_STATUS status;
+	GUCHashEntry *hentry;
+
+	reporting_enabled = false;
+
+	if (guc_hashtab == NULL)
+		return;
+
+	hash_seq_init(&status, guc_hashtab);
+	while ((hentry = (GUCHashEntry *) hash_seq_search(&status)) != NULL)
+	{
+		struct config_generic *conf = hentry->gucvar;
+
+		if (conf->last_reported != NULL)
+		{
+			guc_free(conf->last_reported);
+			conf->last_reported = NULL;
+		}
+	}
+}
+
+void
+ResetGUCReporting(void)
+{
+	ResetGUCReportingInternal();
 }
 
 /*

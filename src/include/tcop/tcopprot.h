@@ -74,6 +74,7 @@ extern void die(SIGNAL_ARGS);
 pg_noreturn extern void quickdie(SIGNAL_ARGS);
 extern void StatementCancelHandler(SIGNAL_ARGS);
 pg_noreturn extern void FloatExceptionHandler(SIGNAL_ARGS);
+extern void SignalHandlerForConfigReload(SIGNAL_ARGS);
 extern void HandleRecoveryConflictInterrupt(ProcSignalReason reason);
 extern void ProcessClientReadInterrupt(bool blocked);
 extern void ProcessClientWriteInterrupt(bool blocked);
@@ -83,6 +84,8 @@ extern void process_postgres_switches(int argc, char *argv[],
 pg_noreturn extern void PostgresSingleUserMain(int argc, char *argv[],
 											   const char *username);
 pg_noreturn extern void PostgresMain(const char *dbname,
+									 const char *username);
+extern void MultiPostgresMain(const char *dbname,
 									 const char *username);
 extern void ResetUsage(void);
 extern void ShowUsage(const char *title);

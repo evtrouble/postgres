@@ -27,6 +27,9 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/pm_backend_comm.h"
+#include "postmaster/connection_pool.h"
+#include "postmaster/interrupt.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -39,6 +42,7 @@
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
+#include "utils/resowner.h"
 #include "utils/timeout.h"
 #include "utils/varlena.h"
 
@@ -65,6 +69,77 @@ static void SendNegotiateProtocolVersion(List *unrecognized_protocol_options);
 static void process_startup_packet_die(SIGNAL_ARGS);
 static void StartupPacketTimeoutHandler(void);
 static bool validate_log_connections_options(List *elemlist, uint32 *flags);
+static void BackendInitializeForReuse(ClientSocket *client_sock);
+
+extern bool IsTransactionOrTransactionBlock(void);
+extern void AbortCurrentTransaction(void);
+
+extern bool enable_connection_pool;
+
+/*
+ * ResetBackendForReuse
+ *		Clean up all per-connection state so the backend can be safely reused
+ *		for a new client connection in a connection pool.
+ *
+ * This must be called AFTER finishing the current client session and BEFORE
+ * waiting for a new connection via receive_socket_from_postmaster().
+ */
+static void
+ResetBackendForReuse(void)
+{
+    /* Transaction cleanup */
+    ReuseProcExitCleanup();
+
+    /* Release (and warn about) any buffer pins leaked */
+    if (AuxProcessResourceOwner != NULL)
+        ReleaseAuxProcessResources(true);
+    CurrentResourceOwner = NULL;
+
+    /* Communication reset */
+    whereToSendOutput = DestNone;
+	/* 旧 socket 的传输层由 socket_close 回调 secure_close；不在此显式 close */
+
+    /* Timeouts */
+    disable_all_timeouts(false);
+
+    /* Interrupt flags */
+    CheckClientConnectionPending = false;
+    ClientConnectionLost = false;
+    IdleInTransactionSessionTimeoutPending = false;
+    TransactionTimeoutPending = false;
+    IdleSessionTimeoutPending = false;
+    IdleStatsUpdateTimeoutPending = false;
+
+    /* Holdoff counters */
+    QueryCancelHoldoffCount = 0;
+
+    /* Latch */
+    if (MyLatch)
+        ResetLatch(MyLatch);
+
+    /* Error context */
+    PG_exception_stack = NULL;
+
+    /* Reset session state */
+    ClientAuthInProgress = true;
+
+    /* Reset GUC options to defaults */
+    ResetAllOptions();
+    ResetGUCReporting();
+	if (FeBeWaitSet)
+    {
+        FreeWaitEventSet(FeBeWaitSet);
+        FeBeWaitSet = NULL;
+    }
+
+    AtEOXact_RelationCache(false); // 清理事务级 relcache 引用
+    RelationCacheInvalidate(false);
+    AtEOXact_HashTables(false);     // 清理 plan cache 等
+    /* Reset memory contexts used per-connection (handled by exit callbacks) */
+
+    /* Update ps display */
+    set_ps_display("idle");
+}
 
 /*
  * Entry point for a new backend process.
@@ -124,9 +199,248 @@ BackendMain(const void *startup_data, size_t startup_data_len)
 	 */
 	MemoryContextSwitchTo(TopMemoryContext);
 
-	PostgresMain(MyProcPort->database_name, MyProcPort->user_name);
+	if (enable_connection_pool)
+	{
+		if (am_walsender)
+			WalSndSignals();
+		else
+		{
+			pqsignal(SIGHUP, SignalHandlerForConfigReload);
+			pqsignal(SIGINT, StatementCancelHandler);
+			pqsignal(SIGTERM, die);
+
+			if (IsUnderPostmaster)
+				pqsignal(SIGQUIT, quickdie);
+			else
+				pqsignal(SIGQUIT, die);
+
+			InitializeTimeouts();
+
+			pqsignal(SIGPIPE, SIG_IGN);
+			pqsignal(SIGUSR1, procsignal_sigusr1_handler);
+			pqsignal(SIGUSR2, SIG_IGN);
+			pqsignal(SIGFPE, FloatExceptionHandler);
+			pqsignal(SIGCHLD, SIG_DFL);
+		}
+
+		BaseInit();
+		sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
+
+		init_pool_backend_socket();
+		while(true) {
+			MultiPostgresMain(MyProcPort->database_name, MyProcPort->user_name);
+
+			/* Clean up and prepare for reuse */
+			ResetBackendForReuse();
+
+			/* Enqueue ourselves to the connection pool */
+			if (!PoolEnqueuePMChild(MyPMChildPtr))
+			{
+				proc_exit(0);
+			}
+			elog(DEBUG2, "backend (pid=%d) returned to connection pool, waiting for reuse",
+						(int) MyProcPid);
+			receive_socket_from_postmaster(MyClientSocket);
+			BackendInitializeForReuse(MyClientSocket);
+		}
+	} else {
+		PostgresMain(MyProcPort->database_name, MyProcPort->user_name);
+	}
 }
 
+static void
+BackendInitializeForReuse(ClientSocket *client_sock)
+{
+	char		remote_host[NI_MAXHOST];
+	char		remote_port[NI_MAXSERV];
+	int			ret;
+	int			status;
+	StringInfoData ps_data;
+
+	pq_reuse(client_sock);
+
+	/* Tell fd.c about the long-lived FD associated with the client_sock */
+	ReserveExternalFD();
+
+	/*
+	 * PreAuthDelay is a debugging aid for investigating problems in the
+	 * authentication cycle: it can be set in postgresql.conf to allow time to
+	 * attach to the newly-forked backend with a debugger.  (See also
+	 * PostAuthDelay, which we allow clients to pass through PGOPTIONS, but it
+	 * is not honored until after authentication.)
+	 */
+	if (PreAuthDelay > 0)
+		pg_usleep(PreAuthDelay * 1000000L);
+
+	/* This flag will remain set until InitPostgres finishes authentication */
+	ClientAuthInProgress = true;	/* limit visibility of log messages */
+
+	whereToSendOutput = DestRemote;
+
+	/*
+	 * We arrange to do _exit(1) if we receive SIGTERM or timeout while trying
+	 * to collect the startup packet; while SIGQUIT results in _exit(2).
+	 * Otherwise the postmaster cannot shutdown the database FAST or IMMED
+	 * cleanly if a buggy client fails to send the packet promptly.
+	 *
+	 * Exiting with _exit(1) is only possible because we have not yet touched
+	 * shared memory; therefore no outside-the-process state needs to get
+	 * cleaned up.
+	 */
+	pqsignal(SIGTERM, process_startup_packet_die);
+	/* SIGQUIT handler was already set up by InitPostmasterChild */
+	InitializeTimeouts();		/* establishes SIGALRM handler */
+	sigprocmask(SIG_SETMASK, &StartupBlockSig, NULL);
+
+	remote_host[0] = '\0';
+	remote_port[0] = '\0';
+	ret = pg_getnameinfo_all(&MyProcPort->raddr.addr, MyProcPort->raddr.salen,
+							 remote_host, sizeof(remote_host),
+							 remote_port, sizeof(remote_port),
+							 (log_hostname ? 0 : NI_NUMERICHOST) | NI_NUMERICSERV);
+	if (ret != 0)
+		ereport(WARNING,
+				(errmsg_internal("pg_getnameinfo_all() failed: %s", gai_strerror(ret))));
+
+	if (MyProcPort->remote_host)
+		pfree(MyProcPort->remote_host);
+	if (MyProcPort->remote_port)
+		pfree(MyProcPort->remote_port);
+	if (MyProcPort->remote_hostname)
+		pfree(MyProcPort->remote_hostname);
+	if (MyProcPort->database_name)
+		pfree(MyProcPort->database_name);
+	if (MyProcPort->user_name)
+		pfree(MyProcPort->user_name);
+	if (MyProcPort->cmdline_options)
+		pfree(MyProcPort->cmdline_options);
+	if (MyProcPort->guc_options)
+		list_free_deep(MyProcPort->guc_options);
+
+	MyProcPort->database_name = NULL;
+	MyProcPort->user_name = NULL;
+	MyProcPort->cmdline_options = NULL;
+	MyProcPort->guc_options = NIL;
+
+	MyProcPort->remote_host = MemoryContextStrdup(TopMemoryContext, remote_host);
+	MyProcPort->remote_port = MemoryContextStrdup(TopMemoryContext, remote_port);
+
+	MyProcPort->remote_hostname = NULL;
+	MyProcPort->remote_hostname_resolv = 0;
+	MyProcPort->remote_hostname_errcode = 0;
+
+	if (log_hostname &&
+		ret == 0 &&
+		strspn(remote_host, "0123456789.") < strlen(remote_host) &&
+		strspn(remote_host, "0123456789ABCDEFabcdef:") < strlen(remote_host))
+	{
+		MyProcPort->remote_hostname = MemoryContextStrdup(TopMemoryContext, remote_host);
+	}
+
+	if (log_connections & LOG_CONNECTION_RECEIPT)
+	{
+		if (remote_port[0])
+			ereport(LOG,
+					(errmsg("connection received: host=%s port=%s",
+							remote_host,
+							remote_port)));
+		else
+			ereport(LOG,
+					(errmsg("connection received: host=%s",
+							remote_host)));
+	}
+
+	/*
+	 * Ready to begin client interaction.  We will give up and _exit(1) after
+	 * a time delay, so that a broken client can't hog a connection
+	 * indefinitely.  PreAuthDelay and any DNS interactions above don't count
+	 * against the time limit.
+	 *
+	 * Note: AuthenticationTimeout is applied here while waiting for the
+	 * startup packet, and then again in InitPostgres for the duration of any
+	 * authentication operations.  So a hostile client could tie up the
+	 * process for nearly twice AuthenticationTimeout before we kick him off.
+	 */
+	RegisterTimeout(STARTUP_PACKET_TIMEOUT, StartupPacketTimeoutHandler);
+	enable_timeout_after(STARTUP_PACKET_TIMEOUT, AuthenticationTimeout * 1000);
+
+	/* Handle direct SSL handshake */
+	status = ProcessSSLStartup(MyProcPort);
+
+	/*
+	 * Receive the startup packet (which might turn out to be a cancel request
+	 * packet).
+	 */
+	if (status == STATUS_OK)
+		status = ProcessStartupPacket(MyProcPort, false, false);
+
+	/*
+	 * Disable the timeout, and prevent SIGTERM again.
+	 */
+	disable_timeout(STARTUP_PACKET_TIMEOUT, false);
+	sigprocmask(SIG_SETMASK, &BlockSig, NULL);
+
+	/*
+	 * Stop here if it was bad or a cancel packet.  ProcessStartupPacket
+	 * already did any appropriate error reporting.
+	 */
+	if (status != STATUS_OK)
+		proc_exit(0);
+
+	/* Check a user name was given. */
+	if (MyProcPort->user_name == NULL || MyProcPort->user_name[0] == '\0')
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+				 errmsg("no PostgreSQL user name specified in startup packet")));
+
+	/* The database defaults to the user name. */
+	if (MyProcPort->database_name == NULL || MyProcPort->database_name[0] == '\0')
+		MyProcPort->database_name = pstrdup(MyProcPort->user_name);
+
+	/*
+	 * Truncate given database and user names to length of a Postgres name.
+	 * This avoids lookup failures when overlength names are given.
+	 */
+	if (strlen(MyProcPort->database_name) >= NAMEDATALEN)
+		MyProcPort->database_name[NAMEDATALEN - 1] = '\0';
+	if (strlen(MyProcPort->user_name) >= NAMEDATALEN)
+		MyProcPort->user_name[NAMEDATALEN - 1] = '\0';
+
+	if (am_walsender)
+		MyBackendType = B_WAL_SENDER;
+	else
+		MyBackendType = B_BACKEND;
+
+	/*
+	 * Normal walsender backends, e.g. for streaming replication, are not
+	 * connected to a particular database. But walsenders used for logical
+	 * replication need to connect to a specific database. We allow streaming
+	 * replication commands to be issued even if connected to a database as it
+	 * can make sense to first make a basebackup and then stream changes
+	 * starting from that.
+	 */
+	if (am_walsender && !am_db_walsender)
+		MyProcPort->database_name[0] = '\0';
+
+	/*
+	 * Now that we have the user and database name, we can set the process
+	 * title for ps.  It's good to do this as early as possible in startup.
+	 */
+	initStringInfo(&ps_data);
+	if (am_walsender)
+		appendStringInfo(&ps_data, "%s ", GetBackendTypeDesc(B_WAL_SENDER));
+	appendStringInfo(&ps_data, "%s ", MyProcPort->user_name);
+	if (MyProcPort->database_name[0] != '\0')
+		appendStringInfo(&ps_data, "%s ", MyProcPort->database_name);
+	appendStringInfoString(&ps_data, MyProcPort->remote_host);
+	if (MyProcPort->remote_port[0] != '\0')
+		appendStringInfo(&ps_data, "(%s)", MyProcPort->remote_port);
+
+	init_ps_display(ps_data.data);
+	pfree(ps_data.data);
+
+	set_ps_display("initializing");
+}
 
 /*
  * BackendInitialize -- initialize an interactive (postmaster-child)

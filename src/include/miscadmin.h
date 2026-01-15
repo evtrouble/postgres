@@ -195,6 +195,9 @@ extern PGDLLIMPORT uint8 MyCancelKey[];
 extern PGDLLIMPORT int MyCancelKeyLength;
 extern PGDLLIMPORT int MyPMChildSlot;
 extern PGDLLIMPORT uintptr_t MyPMChildPtr;  /* PMChild* for connection pool (as address value) */
+extern PGDLLIMPORT bool is_reuse_cleanup;
+extern PGDLLIMPORT int MyControlFd;
+extern PGDLLIMPORT int MyListenFd;
 
 extern PGDLLIMPORT char OutputFileName[];
 extern PGDLLIMPORT char my_exec_path[];
@@ -503,6 +506,10 @@ extern void pg_split_opts(char **argv, int *argcp, const char *optstr);
 extern void InitializeMaxBackends(void);
 extern void InitializeFastPathLocks(void);
 extern void InitPostgres(const char *in_dbname, Oid dboid,
+						 const char *username, Oid useroid,
+						 bits32 flags,
+						 char *out_dbname);
+extern void ReusePostgres(const char *in_dbname, Oid dboid,
 						 const char *username, Oid useroid,
 						 bits32 flags,
 						 char *out_dbname);

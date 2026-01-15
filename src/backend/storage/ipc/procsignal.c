@@ -219,6 +219,42 @@ ProcSignalInit(const uint8 *cancel_key, int cancel_key_len)
 	on_shmem_exit(CleanupProcSignalState, (Datum) 0);
 }
 
+void
+ProcSignalInitForReuse(const uint8 *cancel_key, int cancel_key_len)
+{
+	ProcSignalSlot *slot;
+	uint64		barrier_generation;
+
+	Assert(cancel_key_len >= 0 && cancel_key_len <= MAX_CANCEL_KEY_LENGTH);
+	if (MyProcNumber < 0)
+		elog(ERROR, "MyProcNumber not set");
+	if (MyProcNumber >= NumProcSignalSlots)
+		elog(ERROR, "unexpected MyProcNumber %d in ProcSignalInitForReuse (max %d)", MyProcNumber, NumProcSignalSlots);
+	slot = &ProcSignal->psh_slot[MyProcNumber];
+
+	SpinLockAcquire(&slot->pss_mutex);
+
+	pg_atomic_write_u32(&slot->pss_pid, 0);
+	MemSet(slot->pss_cancel_key, 0, MAX_CANCEL_KEY_LENGTH);
+	slot->pss_cancel_key_len = 0;
+	MemSet(slot->pss_signalFlags, 0, NUM_PROCSIGNALS * sizeof(sig_atomic_t));
+
+	pg_atomic_write_u32(&slot->pss_barrierCheckMask, 0);
+	barrier_generation = pg_atomic_read_u64(&ProcSignal->psh_barrierGeneration);
+	pg_atomic_write_u64(&slot->pss_barrierGeneration, barrier_generation);
+
+	if (cancel_key_len > 0)
+		memcpy(slot->pss_cancel_key, cancel_key, cancel_key_len);
+	slot->pss_cancel_key_len = cancel_key_len;
+
+	pg_atomic_write_u32(&slot->pss_pid, MyProcPid);
+
+	SpinLockRelease(&slot->pss_mutex);
+	MyProcSignalSlot = slot;
+
+	elog(DEBUG1, "ProcSignal slot %d initialized for reused process %d", MyProcNumber, MyProcPid);
+}
+
 /*
  * CleanupProcSignalState
  *		Remove current process from ProcSignal mechanism

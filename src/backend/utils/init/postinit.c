@@ -203,7 +203,6 @@ PerformAuthentication(Port *port)
 	 * FIXME: [fork/exec] Ugh.  Is there a way around this overhead?
 	 */
 #ifdef EXEC_BACKEND
-
 	/*
 	 * load_hba() and load_ident() want to work within the PostmasterContext,
 	 * so create that if it doesn't exist (which it won't).  We'll delete it
@@ -715,8 +714,6 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	char		dbname[NAMEDATALEN];
 	int			nfree = 0;
 
-	elog(DEBUG3, "InitPostgres");
-
 	/*
 	 * Add my PGPROC struct to the ProcArray.
 	 *
@@ -822,6 +819,519 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * AbortTransaction call to clean up.
 	 */
 	before_shmem_exit(ShutdownPostgres, 0);
+
+	/* The autovacuum launcher is done here */
+	if (AmAutoVacuumLauncherProcess())
+	{
+		/* fill in the remainder of this entry in the PgBackendStatus array */
+		pgstat_bestart_final();
+
+		return;
+	}
+
+	/*
+	 * Start a new transaction here before first access to db.
+	 */
+	if (!bootstrap)
+	{
+		/* statement_timestamp must be set for timeouts to work correctly */
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+
+		/*
+		 * transaction_isolation will have been set to the default by the
+		 * above.  If the default is "serializable", and we are in hot
+		 * standby, we will fail if we don't change it to something lower.
+		 * Fortunately, "read committed" is plenty good enough.
+		 */
+		XactIsoLevel = XACT_READ_COMMITTED;
+	}
+
+	/*
+	 * Perform client authentication if necessary, then figure out our
+	 * postgres user ID, and see if we are a superuser.
+	 *
+	 * In standalone mode, autovacuum worker processes and slot sync worker
+	 * process, we use a fixed ID, otherwise we figure it out from the
+	 * authenticated user name.
+	 */
+	if (bootstrap || AmAutoVacuumWorkerProcess() || AmLogicalSlotSyncWorkerProcess())
+	{
+		InitializeSessionUserIdStandalone();
+		am_superuser = true;
+	}
+	else if (!IsUnderPostmaster)
+	{
+		InitializeSessionUserIdStandalone();
+		am_superuser = true;
+		if (!ThereIsAtLeastOneRole())
+			ereport(WARNING,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("no roles are defined in this database system"),
+					 errhint("You should immediately run CREATE USER \"%s\" SUPERUSER;.",
+							 username != NULL ? username : "postgres")));
+	}
+	else if (AmBackgroundWorkerProcess())
+	{
+		if (username == NULL && !OidIsValid(useroid))
+		{
+			InitializeSessionUserIdStandalone();
+			am_superuser = true;
+		}
+		else
+		{
+			InitializeSessionUserId(username, useroid,
+									(flags & INIT_PG_OVERRIDE_ROLE_LOGIN) != 0);
+			am_superuser = superuser();
+		}
+	}
+	else
+	{
+		/* normal multiuser case */
+		Assert(MyProcPort != NULL);
+		PerformAuthentication(MyProcPort);
+		InitializeSessionUserId(username, useroid, false);
+		/* ensure that auth_method is actually valid, aka authn_id is not NULL */
+		if (MyClientConnectionInfo.authn_id)
+			InitializeSystemUser(MyClientConnectionInfo.authn_id,
+								 hba_authname(MyClientConnectionInfo.auth_method));
+		am_superuser = superuser();
+	}
+
+	/* Report any SSL/GSS details for the session. */
+	if (MyProcPort != NULL)
+	{
+		Assert(!bootstrap);
+
+		pgstat_bestart_security();
+	}
+
+	/*
+	 * Binary upgrades only allowed super-user connections
+	 */
+	if (IsBinaryUpgrade && !am_superuser)
+	{
+		ereport(FATAL,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to connect in binary upgrade mode")));
+	}
+
+	/*
+	 * The last few regular connection slots are reserved for superusers and
+	 * roles with privileges of pg_use_reserved_connections.  We do not apply
+	 * these limits to background processes, since they all have their own
+	 * pools of PGPROC slots.
+	 *
+	 * Note: At this point, the new backend has already claimed a proc struct,
+	 * so we must check whether the number of free slots is strictly less than
+	 * the reserved connection limits.
+	 */
+	if (AmRegularBackendProcess() && !am_superuser &&
+		(SuperuserReservedConnections + ReservedConnections) > 0 &&
+		!HaveNFreeProcs(SuperuserReservedConnections + ReservedConnections, &nfree))
+	{
+		if (nfree < SuperuserReservedConnections)
+			ereport(FATAL,
+					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
+					 errmsg("remaining connection slots are reserved for roles with the %s attribute",
+							"SUPERUSER")));
+
+		if (!has_privs_of_role(GetUserId(), ROLE_PG_USE_RESERVED_CONNECTIONS))
+			ereport(FATAL,
+					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
+					 errmsg("remaining connection slots are reserved for roles with privileges of the \"%s\" role",
+							"pg_use_reserved_connections")));
+	}
+
+	/* Check replication permissions needed for walsender processes. */
+	if (am_walsender)
+	{
+		Assert(!bootstrap);
+
+		if (!has_rolreplication(GetUserId()))
+			ereport(FATAL,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied to start WAL sender"),
+					 errdetail("Only roles with the %s attribute may start a WAL sender process.",
+							   "REPLICATION")));
+	}
+
+	/*
+	 * If this is a plain walsender only supporting physical replication, we
+	 * don't want to connect to any particular database. Just finish the
+	 * backend startup by processing any options from the startup packet, and
+	 * we're done.
+	 */
+	if (am_walsender && !am_db_walsender)
+	{
+		/* process any options passed in the startup packet */
+		if (MyProcPort != NULL)
+			process_startup_options(MyProcPort, am_superuser);
+
+		/* Apply PostAuthDelay as soon as we've read all options */
+		if (PostAuthDelay > 0)
+			pg_usleep(PostAuthDelay * 1000000L);
+
+		/* initialize client encoding */
+		InitializeClientEncoding();
+
+		/* fill in the remainder of this entry in the PgBackendStatus array */
+		pgstat_bestart_final();
+
+		/* close the transaction we started above */
+		CommitTransactionCommand();
+
+		return;
+	}
+
+	/*
+	 * Set up the global variables holding database id and default tablespace.
+	 * But note we won't actually try to touch the database just yet.
+	 *
+	 * We take a shortcut in the bootstrap case, otherwise we have to look up
+	 * the db's entry in pg_database.
+	 */
+	if (bootstrap)
+	{
+		dboid = Template1DbOid;
+		MyDatabaseTableSpace = DEFAULTTABLESPACE_OID;
+	}
+	else if (in_dbname != NULL)
+	{
+		HeapTuple	tuple;
+		Form_pg_database dbform;
+
+		tuple = GetDatabaseTuple(in_dbname);
+		if (!HeapTupleIsValid(tuple))
+			ereport(FATAL,
+					(errcode(ERRCODE_UNDEFINED_DATABASE),
+					 errmsg("database \"%s\" does not exist", in_dbname)));
+		dbform = (Form_pg_database) GETSTRUCT(tuple);
+		dboid = dbform->oid;
+	}
+	else if (!OidIsValid(dboid))
+	{
+		/*
+		 * If this is a background worker not bound to any particular
+		 * database, we're done now.  Everything that follows only makes sense
+		 * if we are bound to a specific database.  We do need to close the
+		 * transaction we started before returning.
+		 */
+		if (!bootstrap)
+		{
+			pgstat_bestart_final();
+			CommitTransactionCommand();
+		}
+		return;
+	}
+
+	/*
+	 * Now, take a writer's lock on the database we are trying to connect to.
+	 * If there is a concurrently running DROP DATABASE on that database, this
+	 * will block us until it finishes (and has committed its update of
+	 * pg_database).
+	 *
+	 * Note that the lock is not held long, only until the end of this startup
+	 * transaction.  This is OK since we will advertise our use of the
+	 * database in the ProcArray before dropping the lock (in fact, that's the
+	 * next thing to do).  Anyone trying a DROP DATABASE after this point will
+	 * see us in the array once they have the lock.  Ordering is important for
+	 * this because we don't want to advertise ourselves as being in this
+	 * database until we have the lock; otherwise we create what amounts to a
+	 * deadlock with CountOtherDBBackends().
+	 *
+	 * Note: use of RowExclusiveLock here is reasonable because we envision
+	 * our session as being a concurrent writer of the database.  If we had a
+	 * way of declaring a session as being guaranteed-read-only, we could use
+	 * AccessShareLock for such sessions and thereby not conflict against
+	 * CREATE DATABASE.
+	 */
+	if (!bootstrap)
+		LockSharedObject(DatabaseRelationId, dboid, 0, RowExclusiveLock);
+
+	/*
+	 * Recheck pg_database to make sure the target database hasn't gone away.
+	 * If there was a concurrent DROP DATABASE, this ensures we will die
+	 * cleanly without creating a mess.
+	 */
+	if (!bootstrap)
+	{
+		HeapTuple	tuple;
+		Form_pg_database datform;
+
+		tuple = GetDatabaseTupleByOid(dboid);
+		if (HeapTupleIsValid(tuple))
+			datform = (Form_pg_database) GETSTRUCT(tuple);
+
+		if (!HeapTupleIsValid(tuple) ||
+			(in_dbname && namestrcmp(&datform->datname, in_dbname)))
+		{
+			if (in_dbname)
+				ereport(FATAL,
+						(errcode(ERRCODE_UNDEFINED_DATABASE),
+						 errmsg("database \"%s\" does not exist", in_dbname),
+						 errdetail("It seems to have just been dropped or renamed.")));
+			else
+				ereport(FATAL,
+						(errcode(ERRCODE_UNDEFINED_DATABASE),
+						 errmsg("database %u does not exist", dboid)));
+		}
+
+		strlcpy(dbname, NameStr(datform->datname), sizeof(dbname));
+
+		if (database_is_invalid_form(datform))
+		{
+			ereport(FATAL,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("cannot connect to invalid database \"%s\"", dbname),
+					errhint("Use DROP DATABASE to drop invalid databases."));
+		}
+
+		MyDatabaseTableSpace = datform->dattablespace;
+		MyDatabaseHasLoginEventTriggers = datform->dathasloginevt;
+		/* pass the database name back to the caller */
+		if (out_dbname)
+			strcpy(out_dbname, dbname);
+	}
+
+	/*
+	 * Now that we rechecked, we are certain to be connected to a database and
+	 * thus can set MyDatabaseId.
+	 *
+	 * It is important that MyDatabaseId only be set once we are sure that the
+	 * target database can no longer be concurrently dropped or renamed.  For
+	 * example, without this guarantee, pgstat_update_dbstats() could create
+	 * entries for databases that were just dropped in the pgstat shutdown
+	 * callback, which could confuse other code paths like the autovacuum
+	 * scheduler.
+	 */
+	MyDatabaseId = dboid;
+
+	/*
+	 * Now we can mark our PGPROC entry with the database ID.
+	 *
+	 * We assume this is an atomic store so no lock is needed; though actually
+	 * things would work fine even if it weren't atomic.  Anyone searching the
+	 * ProcArray for this database's ID should hold the database lock, so they
+	 * would not be executing concurrently with this store.  A process looking
+	 * for another database's ID could in theory see a chance match if it read
+	 * a partially-updated databaseId value; but as long as all such searches
+	 * wait and retry, as in CountOtherDBBackends(), they will certainly see
+	 * the correct value on their next try.
+	 */
+	MyProc->databaseId = MyDatabaseId;
+
+	/*
+	 * We established a catalog snapshot while reading pg_authid and/or
+	 * pg_database; but until we have set up MyDatabaseId, we won't react to
+	 * incoming sinval messages for unshared catalogs, so we won't realize it
+	 * if the snapshot has been invalidated.  Assume it's no good anymore.
+	 */
+	InvalidateCatalogSnapshot();
+
+	/*
+	 * Now we should be able to access the database directory safely. Verify
+	 * it's there and looks reasonable.
+	 */
+	fullpath = GetDatabasePath(MyDatabaseId, MyDatabaseTableSpace);
+
+	if (!bootstrap)
+	{
+		if (access(fullpath, F_OK) == -1)
+		{
+			if (errno == ENOENT)
+				ereport(FATAL,
+						(errcode(ERRCODE_UNDEFINED_DATABASE),
+						 errmsg("database \"%s\" does not exist",
+								dbname),
+						 errdetail("The database subdirectory \"%s\" is missing.",
+								   fullpath)));
+			else
+				ereport(FATAL,
+						(errcode_for_file_access(),
+						 errmsg("could not access directory \"%s\": %m",
+								fullpath)));
+		}
+
+		ValidatePgVersion(fullpath);
+	}
+
+	SetDatabasePath(fullpath);
+	pfree(fullpath);
+
+	/*
+	 * It's now possible to do real access to the system catalogs.
+	 *
+	 * Load relcache entries for the system catalogs.  This must create at
+	 * least the minimum set of "nailed-in" cache entries.
+	 */
+	RelationCacheInitializePhase3();
+
+	/* set up ACL framework (so CheckMyDatabase can check permissions) */
+	initialize_acl();
+
+	/*
+	 * Re-read the pg_database row for our database, check permissions and set
+	 * up database-specific GUC settings.  We can't do this until all the
+	 * database-access infrastructure is up.  (Also, it wants to know if the
+	 * user is a superuser, so the above stuff has to happen first.)
+	 */
+	if (!bootstrap)
+		CheckMyDatabase(dbname, am_superuser,
+						(flags & INIT_PG_OVERRIDE_ALLOW_CONNS) != 0);
+
+	/*
+	 * Now process any command-line switches and any additional GUC variable
+	 * settings passed in the startup packet.   We couldn't do this before
+	 * because we didn't know if client is a superuser.
+	 */
+	if (MyProcPort != NULL)
+		process_startup_options(MyProcPort, am_superuser);
+
+	/* Process pg_db_role_setting options */
+	process_settings(MyDatabaseId, GetSessionUserId());
+
+	/* Apply PostAuthDelay as soon as we've read all options */
+	if (PostAuthDelay > 0)
+		pg_usleep(PostAuthDelay * 1000000L);
+
+	/*
+	 * Initialize various default states that can't be set up until we've
+	 * selected the active user and gotten the right GUC settings.
+	 */
+
+	/* set default namespace search path */
+	InitializeSearchPath();
+
+	/* initialize client encoding */
+	InitializeClientEncoding();
+
+	/* Initialize this backend's session state. */
+	InitializeSession();
+
+	/*
+	 * If this is an interactive session, load any libraries that should be
+	 * preloaded at backend start.  Since those are determined by GUCs, this
+	 * can't happen until GUC settings are complete, but we want it to happen
+	 * during the initial transaction in case anything that requires database
+	 * access needs to be done.
+	 */
+	if ((flags & INIT_PG_LOAD_SESSION_LIBS) != 0)
+		process_session_preload_libraries();
+
+	/* fill in the remainder of this entry in the PgBackendStatus array */
+	if (!bootstrap)
+		pgstat_bestart_final();
+
+	/* close the transaction we started above */
+	if (!bootstrap)
+		CommitTransactionCommand();
+}
+
+void
+ReusePostgres(const char *in_dbname, Oid dboid,
+			 const char *username, Oid useroid,
+			 bits32 flags,
+			 char *out_dbname)
+{
+	bool		bootstrap = IsBootstrapProcessingMode();
+	bool		am_superuser;
+	char	   *fullpath;
+	char		dbname[NAMEDATALEN];
+	int			nfree = 0;
+
+	/*
+	 * Add my PGPROC struct to the ProcArray.
+	 *
+	 * Once I have done this, I am visible to other backends!
+	 */
+	// InitProcessPhase2();
+
+	/* Initialize status reporting */
+	// pgstat_beinit();
+
+	/*
+	 * And initialize an entry in the PgBackendStatus array.  That way, if
+	 * LWLocks or third-party authentication should happen to hang, it is
+	 * possible to retrieve some information about what is going on.
+	 */
+	if (!bootstrap)
+	{
+		pgstat_bestart_initial();
+		INJECTION_POINT("init-pre-auth", NULL);
+	}
+
+	/*
+	 * Initialize my entry in the shared-invalidation manager's array of
+	 * per-backend data.
+	 */
+	if (!bootstrap)
+		SharedInvalBackendInitForReuse(false);
+
+	ProcSignalInitForReuse(MyCancelKey, MyCancelKeyLength);
+
+	/* timeouts are registered once in InitPostgres; reuse sessions only reuse them */
+	// if (!bootstrap)
+	// {
+	// 	RegisterTimeout(DEADLOCK_TIMEOUT, CheckDeadLockAlert);
+	// 	RegisterTimeout(STATEMENT_TIMEOUT, StatementTimeoutHandler);
+	// 	RegisterTimeout(LOCK_TIMEOUT, LockTimeoutHandler);
+	// 	RegisterTimeout(IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+	// 					IdleInTransactionSessionTimeoutHandler);
+	// 	RegisterTimeout(TRANSACTION_TIMEOUT, TransactionTimeoutHandler);
+	// 	RegisterTimeout(IDLE_SESSION_TIMEOUT, IdleSessionTimeoutHandler);
+	// 	RegisterTimeout(CLIENT_CONNECTION_CHECK_TIMEOUT, ClientCheckTimeoutHandler);
+	// 	RegisterTimeout(IDLE_STATS_UPDATE_TIMEOUT,
+	// 					IdleStatsUpdateTimeoutHandler);
+	// }
+
+	/*
+	 * If this is either a bootstrap process or a standalone backend, start up
+	 * the XLOG machinery, and register to have it closed down at exit. In
+	 * other cases, the startup process is responsible for starting up the
+	 * XLOG machinery, and the checkpointer for closing it down.
+	 */
+	if (!IsUnderPostmaster)
+	{
+		/*
+		 * We don't yet have an aux-process resource owner, but StartupXLOG
+		 * and ShutdownXLOG will need one.  Hence, create said resource owner
+		 * (and register a callback to clean it up after ShutdownXLOG runs).
+		 */
+		CreateAuxProcessResourceOwner();
+
+		StartupXLOG();
+		/* Release (and warn about) any buffer pins leaked in StartupXLOG */
+		ReleaseAuxProcessResources(true);
+		/* Reset CurrentResourceOwner to nothing for the moment */
+		CurrentResourceOwner = NULL;
+
+		/*
+		 * Use before_shmem_exit() so that ShutdownXLOG() can rely on DSM
+		 * segments etc to work (which in turn is required for pgstats).
+		 */
+		// before_shmem_exit(pgstat_before_server_shutdown, 0);
+		// before_shmem_exit(ShutdownXLOG, 0);
+	}
+
+	/*
+	 * Initialize the relation cache and the system catalog caches.  Note that
+	 * no catalog access happens here; we only set up the hashtable structure.
+	 * We must do this before starting a transaction because transaction abort
+	 * would try to touch these hashtables.
+	 */
+	// RelationCacheInitialize();
+	// InitCatalogCache();
+	// InitPlanCache();
+
+	/* Initialize portal manager */
+	// EnablePortalManager();
+
+	/*
+	 * Load relcache entries for the shared system catalogs.  This must create
+	 * at least entries for pg_database and catalogs used for authentication.
+	 */
+	// RelationCacheInitializePhase2();
 
 	/* The autovacuum launcher is done here */
 	if (AmAutoVacuumLauncherProcess())

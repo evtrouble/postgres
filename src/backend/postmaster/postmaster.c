@@ -105,6 +105,7 @@
 #include "postmaster/connection_pool.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/pm_backend_comm.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
 #include "replication/logicallauncher.h"
@@ -116,6 +117,7 @@
 #include "storage/ipc.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
 #include "utils/datetime.h"
@@ -960,17 +962,6 @@ PostmasterMain(int argc, char *argv[])
 	InitPostmasterChildSlots();
 
 	/*
-	 * Initialize connection pool if enabled.
-	 */
-	if (enable_connection_pool)
-	{
-		InitConnectionPool();
-		ConfigureConnectionPool();
-		elog(LOG, "connection pool enabled (size=%d, idle_timeout=%d)",
-			 connection_pool_size, connection_pool_idle_timeout);
-	}
-
-	/*
 	 * Calculate the size of the PGPROC fast-path lock arrays.
 	 */
 	InitializeFastPathLocks();
@@ -1033,6 +1024,17 @@ PostmasterMain(int argc, char *argv[])
 	 * wake up from sleep on postmaster death.
 	 */
 	InitPostmasterDeathWatchHandle();
+
+	/*
+	 * Initialize connection pool if enabled.
+	 */
+	if (enable_connection_pool)
+	{
+		InitConnectionPool();
+		ConfigureConnectionPool();
+		elog(LOG, "connection pool enabled (size=%d, idle_timeout=%d)",
+			 connection_pool_size, connection_pool_idle_timeout);
+	}
 
 #ifdef WIN32
 
@@ -1739,14 +1741,52 @@ ServerLoop(void)
 						
 						if (idle_backend != NULL)
 						{
+							PGPROC *proc = BackendPidGetProc(idle_backend->pid);
+							idle_backend->procLatch = &proc->procLatch;
 							/*
-							 * TODO: Implement connection assignment to idle backend.
-							 * For now, we'll create a new backend and note that
-							 * connection pooling is not fully functional yet.
+							 * The procLatch should have been set when the backend was
+							 * created in BackendStartup(). If it's NULL, something went
+							 * wrong (backend exited or hasn't initialized yet), so we
+							 * fall back to creating a new backend.
 							 */
-							elog(DEBUG2, "got idle backend from pool (pid=%d), but connection assignment not implemented yet, creating new backend",
-								 (int) idle_backend->pid);
-							/* Fall through to create new backend for now */
+							if (idle_backend->procLatch == NULL)
+							{
+								elog(DEBUG2, "backend (pid=%d) procLatch not available, creating new backend",
+									 (int) idle_backend->pid);
+								/* Fall through to create new backend */
+							}
+							else if (send_socket_to_backend(idle_backend, &s))
+							{									
+								elog(DEBUG2, "assigned new connection to idle backend (pid=%d)",
+										(int) idle_backend->pid);
+									
+								/*
+									* We no longer need the socket in this process.
+									* The backend now owns it.
+									*/
+								if (s.sock != PGINVALID_SOCKET)
+								{
+									if (closesocket(s.sock) != 0)
+										elog(LOG, "could not close client socket: %m");
+									
+									/* Skip creating a new backend */
+									continue;
+								}
+								else
+								{
+									/*
+									 * Socket passing failed. This could happen if:
+									 * - Socket passing mechanism is not yet implemented
+									 * - Backend died or is no longer in the pool
+									 * - Socket passing error occurred
+									 * 
+									 * Fall back to creating a new backend.
+									 */
+									elog(DEBUG2, "failed to assign connection to idle backend (pid=%d), creating new backend",
+										 (int) idle_backend->pid);
+									/* Fall through to create new backend */
+								}
+							}
 						}
 					}
 					
@@ -1781,7 +1821,7 @@ ServerLoop(void)
 		 * Clean up expired backends from connection pool if enabled.
 		 * Do this periodically (every loop iteration is fine, cleanup is cheap).
 		 */
-		if (enable_connection_pool)
+		if (enable_connection_pool && Shutdown == NoShutdown)
 		{
 			PoolCleanupExpired();
 		}

@@ -61,6 +61,7 @@ int			IdleInTransactionSessionTimeout = 0;
 int			TransactionTimeout = 0;
 int			IdleSessionTimeout = 0;
 bool		log_lock_waits = true;
+extern bool enable_connection_pool;
 
 /* Pointer to this process's PGPROC struct, if any */
 PGPROC	   *MyProc = NULL;
@@ -84,7 +85,7 @@ static DeadLockState deadlock_state = DS_NOT_YET_CHECKED;
 /* Is a deadlock check pending? */
 static volatile sig_atomic_t got_deadlock_timeout;
 
-static void RemoveProcFromArray(int code, Datum arg);
+void RemoveProcFromArray(int code, Datum arg);
 static void ProcKill(int code, Datum arg);
 static void AuxiliaryProcKill(int code, Datum arg);
 static void CheckDeadLock(void);
@@ -904,7 +905,7 @@ ProcReleaseLocks(bool isCommit)
 /*
  * RemoveProcFromArray() -- Remove this process from the shared ProcArray.
  */
-static void
+void
 RemoveProcFromArray(int code, Datum arg)
 {
 	Assert(MyProc != NULL);
@@ -920,6 +921,9 @@ ProcKill(int code, Datum arg)
 {
 	PGPROC	   *proc;
 	dlist_head *procgloballist;
+
+    if (is_reuse_cleanup)
+		return;
 
 	Assert(MyProc != NULL);
 
