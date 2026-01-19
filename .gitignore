@@ -45,3 +45,4 @@ lib*.pc
 /portlock/
 
 .vscode
+__pycache__/

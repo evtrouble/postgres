@@ -267,6 +267,11 @@ CleanupProcSignalState(int status, Datum arg)
 	pid_t		old_pid;
 	ProcSignalSlot *slot = MyProcSignalSlot;
 
+	if (slot == NULL)
+	{
+		return;
+	}
+
 	/*
 	 * Clear MyProcSignalSlot, so that a SIGUSR1 received after this point
 	 * won't try to access it after it's no longer ours (and perhaps even

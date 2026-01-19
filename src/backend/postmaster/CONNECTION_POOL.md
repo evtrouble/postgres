@@ -14,6 +14,30 @@ PostgreSQL 内置连接池是一个无锁（lock-free）连接池实现，用于
 - **入队操作**：多个后端进程在完成客户端连接后，原子性地将 `PMChild*` 入队
 - **出队操作**：postmaster 的 accept 循环（单消费者）直接出队 `PMChild*`，无需查找
 
+#### 1.1 误判降低是如何实现的
+
+连接池里“误判”主要指两类：
+- **把队列误判为空**：实际上已有后端完成入队，但 postmaster 在 `Peek/Dequeue` 时返回 `NULL`（通常是短暂的竞争窗口导致）。
+- **把队列误判为满**：实际上存在可用槽位，但生产者 `Enqueue` 返回失败（同样通常是竞争窗口或计数/标识回绕导致）。
+
+为降低这些误判，队列对每个槽位引入了一个单调递增的 `seq`（sequence）字段，并用它作为“槽位状态机”的唯一判据，而不是依赖 `pmchild_ptr != 0` 这种容易被写入重排/可见性影响的判断。
+
+核心协议（bounded ring + per-slot sequence）：
+- 初始化时：第 i 个槽位 `seq = i`，表示“该槽位可被写入，期望的位置是 i”
+- 生产者入队（pos = tail）：
+  - 只有当 `cell->seq == pos` 时，才表示该槽位“属于当前 pos，可写”
+  - 成功占有 `tail` 后，先写入 `idle_since` 与 `pmchild_ptr`，再以发布语义把 `cell->seq` 写为 `pos + 1`，表示“该槽位已就绪，可被消费”
+- 消费者出队/窥视（pos = head）：
+  - 只有当 `cell->seq == pos + 1` 时，才表示该槽位“对当前 pos 已就绪，可读”
+  - 出队完成后，以发布语义把 `cell->seq` 写为 `pos + capacity`，表示“该槽位已释放，下一轮可被写入”
+
+之所以能降低误判，关键在于：
+- **用 `seq` 把“占位/写数据/发布就绪”分离**：消费者只看 `seq` 是否到达“就绪态”，避免读到“指针还没写完/时间戳还没可见”的中间态。
+- **在 `seq` 读写上使用内存屏障语义**：生产者用带 membarrier 的写把数据发布出去；消费者用带 membarrier 的读保证在观察到“就绪 seq”之后，后续读取到的 `pmchild_ptr/idle_since` 是同一次入队的数据，而不是旧值/部分可见的值。
+- **`seq/head/tail` 使用 64 位避免回绕**：`pos` 会持续递增，`dif = seq - pos` 依赖“长时间单调”这一假设；若用较小位宽，回绕会把“空/满”判定翻转，导致长期的误判甚至卡死。
+
+在当前连接池使用方式下，peek 返回 `NULL` 仍可能发生（生产者刚占到 `tail` 但尚未发布 `seq=pos+1`），但它只会是短暂的竞争窗口；随着一次循环或下一次事件触发，状态会稳定下来。
+
 ### 2. 并发模型
 
 - **多生产者**：多个后端进程并发地将 `PMChild*` 入队
@@ -231,10 +255,13 @@ typedef struct ConnectionPoolShmem
 
 ```c
 typedef struct PoolSlotEntry {
-    uintptr_t   pmchild_ptr;   /* PMChild* 作为地址值（0 表示空） */
-    TimestampTz idle_since;     /* 后端变为空闲的时间戳 */
+    pg_atomic_uint64 seq;         /* 槽位序号：协调并发读写与状态 */
+    pg_atomic_uint64 pmchild_ptr; /* PMChild* 作为地址值（0 表示空） */
+    TimestampTz idle_since;       /* 后端变为空闲的时间戳 */
 } PoolSlotEntry;
 ```
+
+`idle_since` 不使用原子类型的前提是：消费者只有在观察到“就绪态”的 `seq` 之后才读取它，且 `seq` 的读写使用了合适的内存屏障语义，从而把 `idle_since` 的写入可见性一并“带出来”。
 
 ### 关键函数
 
@@ -275,4 +302,3 @@ typedef struct PoolSlotEntry {
 1. **连接分配**：实现将新连接分配给已存在的后端进程的机制
 2. **动态扩容**：支持动态增加队列容量（需要重新分配共享内存）
 3. **统计信息**：提供更详细的连接池统计信息
-

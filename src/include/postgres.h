@@ -536,8 +536,5 @@ Float8GetDatum(float8 X)
 #define NON_EXEC_STATIC static
 #endif
 
-// CONNECTION TODO: 可配置
-#define POOL_BACKEND_SOCKET_DIR "/tmp"
-#define POOL_BACKEND_SOCKET_FORMAT POOL_BACKEND_SOCKET_DIR "/.s.PGSQL.pool.%d"
 
 #endif							/* POSTGRES_H */

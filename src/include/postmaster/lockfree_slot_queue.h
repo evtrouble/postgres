@@ -24,13 +24,14 @@
  * - The pointer value is just an integer/address that gets passed through
  */
 typedef struct PoolSlotEntry {
-    uintptr_t   pmchild_ptr;   /* PMChild* as address value (0 means empty) */
+    pg_atomic_uint64 seq;        /* slot sequence for lock-free coordination */
+    pg_atomic_uint64 pmchild_ptr; /* PMChild* as address value */
     TimestampTz idle_since;     /* when this backend became idle */
 } PoolSlotEntry;
 
 typedef struct LockFreeSlotQueue {
-    pg_atomic_uint32 head;      /* next position to dequeue (consumer) */
-    pg_atomic_uint32 tail;      /* next position to enqueue (producer) */
+    pg_atomic_uint64 head;      /* next position to dequeue (consumer) */
+    pg_atomic_uint64 tail;      /* next position to enqueue (producer) */
     uint32          capacity;   /* queue capacity (equals MaxBackends) */
     PoolSlotEntry  *entries;    /* shared memory array of slot entries */
 } LockFreeSlotQueue;

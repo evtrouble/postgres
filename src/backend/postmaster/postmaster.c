@@ -93,9 +93,11 @@
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
 #include "common/file_perm.h"
+#include "common/hashfn.h"
 #include "common/pg_prng.h"
 #include "lib/ilist.h"
 #include "libpq/libpq.h"
+#include "libpq/pqcomm.h"
 #include "libpq/pqsignal.h"
 #include "pg_getopt.h"
 #include "pgstat.h"
@@ -130,6 +132,124 @@
 #include "common/file_utils.h"
 #include "storage/pg_shmem.h"
 #endif
+
+static bool
+startup_packet_target_db(pgsocket sock, char *dbname, Size dbname_buflen, uint64 *db_hash)
+{
+#ifdef WIN32
+	if (dbname != NULL && dbname_buflen > 0)
+		dbname[0] = '\0';
+	if (db_hash != NULL)
+		*db_hash = 0;
+	return false;
+#else
+	ssize_t		nread;
+	uint32		packet_len;
+	uint32		proto;
+	char	   *buf;
+	uint64		local_db_hash = 0;
+	char	   *dbname_in = NULL;
+	char	   *user_in = NULL;
+	int			flags = MSG_PEEK;
+
+	if (sock == PGINVALID_SOCKET)
+		return false;
+
+#ifdef MSG_DONTWAIT
+	flags |= MSG_DONTWAIT;
+#else
+	return false;
+#endif
+
+	nread = recv(sock, (char *) &packet_len, sizeof(packet_len), flags);
+	if (nread != sizeof(packet_len))
+		return false;
+
+	packet_len = pg_ntoh32(packet_len);
+	if (packet_len < 8 || packet_len > MAX_STARTUP_PACKET_LENGTH)
+		return false;
+
+	buf = palloc(packet_len + 1);
+	buf[packet_len] = '\0';
+
+	nread = recv(sock, buf, packet_len, flags);
+	if (nread != packet_len)
+	{
+		pfree(buf);
+		return false;
+	}
+
+	memcpy(&proto, buf + 4, sizeof(proto));
+	proto = pg_ntoh32(proto);
+
+	if (proto == CANCEL_REQUEST_CODE ||
+		proto == NEGOTIATE_SSL_CODE ||
+		proto == NEGOTIATE_GSS_CODE)
+	{
+		pfree(buf);
+		return false;
+	}
+
+	if (PG_PROTOCOL_MAJOR(proto) < PG_PROTOCOL_MAJOR(PG_PROTOCOL_EARLIEST) ||
+		PG_PROTOCOL_MAJOR(proto) > PG_PROTOCOL_MAJOR(PG_PROTOCOL_LATEST))
+	{
+		pfree(buf);
+		return false;
+	}
+
+	{
+		int32		offset = 4 + sizeof(ProtocolVersion);
+
+		while (offset < packet_len)
+		{
+			char	   *nameptr = buf + offset;
+			int32		valoffset;
+			char	   *valptr;
+
+			if (*nameptr == '\0')
+				break;
+
+			valoffset = offset + strlen(nameptr) + 1;
+			if (valoffset >= packet_len)
+				break;
+
+			valptr = buf + valoffset;
+
+			if (strcmp(nameptr, "database") == 0)
+				dbname_in = valptr;
+			else if (strcmp(nameptr, "user") == 0)
+				user_in = valptr;
+
+			offset = valoffset + strlen(valptr) + 1;
+		}
+	}
+
+	if (dbname_in == NULL || dbname_in[0] == '\0')
+		dbname_in = user_in;
+
+	if (dbname != NULL && dbname_buflen > 0)
+		dbname[0] = '\0';
+
+	if (dbname_in != NULL && dbname_in[0] != '\0')
+	{
+		char		dbname_trunc[NAMEDATALEN];
+		Size		dbname_len;
+
+		strlcpy(dbname_trunc, dbname_in, sizeof(dbname_trunc));
+		if (dbname != NULL && dbname_buflen > 0)
+			strlcpy(dbname, dbname_trunc, dbname_buflen);
+		dbname_len = strlen(dbname_trunc);
+		local_db_hash = hash_bytes_extended((const unsigned char *) dbname_trunc,
+											(int) dbname_len,
+											0);
+	}
+
+	pfree(buf);
+	if (db_hash != NULL)
+		*db_hash = local_db_hash;
+	return (dbname_in != NULL && dbname_in[0] != '\0' && local_db_hash != 0);
+#endif
+}
 
 
 /*
@@ -444,7 +564,7 @@ static void UpdatePMState(PMState newState);
 
 pg_noreturn static void ExitPostmaster(int status);
 static int	ServerLoop(void);
-static int	BackendStartup(ClientSocket *client_sock);
+static int	BackendStartup(ClientSocket *client_sock, const char *target_dbname, uint64 db_hash);
 static void report_fork_failure_to_client(ClientSocket *client_sock, int errnum);
 static CAC_state canAcceptConnections(BackendType backend_type);
 static void signal_child(PMChild *pmchild, int signal);
@@ -1727,6 +1847,10 @@ ServerLoop(void)
 			if (events[i].events & WL_SOCKET_ACCEPT)
 			{
 				ClientSocket s;
+				char		target_dbname[NAMEDATALEN];
+				uint64		db_hash = 0;
+
+				target_dbname[0] = '\0';
 
 				if (AcceptConnection(events[i].fd, &s) == STATUS_OK)
 				{
@@ -1737,12 +1861,24 @@ ServerLoop(void)
 					 */
 					if (enable_connection_pool)
 					{
-						PMChild *idle_backend = PoolGetIdleBackend();
+						PMChild *idle_backend = NULL;
+						bool		got_target_db = false;
+
+						(void) startup_packet_target_db(s.sock,
+														target_dbname,
+														sizeof(target_dbname),
+														&db_hash);
+
+						got_target_db = (target_dbname[0] != '\0' && db_hash != 0);
+						if (got_target_db)
+							idle_backend = PoolGetIdleBackendByDbName(target_dbname, db_hash);
+						else
+							idle_backend = PoolGetIdleBackend();
 						
 						if (idle_backend != NULL)
 						{
 							PGPROC *proc = BackendPidGetProc(idle_backend->pid);
-							idle_backend->procLatch = &proc->procLatch;
+							idle_backend->procLatch = proc ? &proc->procLatch : NULL;
 							/*
 							 * The procLatch should have been set when the backend was
 							 * created in BackendStartup(). If it's NULL, something went
@@ -1756,7 +1892,14 @@ ServerLoop(void)
 								/* Fall through to create new backend */
 							}
 							else if (send_socket_to_backend(idle_backend, &s))
-							{									
+							{
+								if (got_target_db)
+								{
+									strlcpy(idle_backend->last_dbname, target_dbname,
+											sizeof(idle_backend->last_dbname));
+									idle_backend->last_db_hash = db_hash;
+								}
+
 								elog(DEBUG2, "assigned new connection to idle backend (pid=%d)",
 										(int) idle_backend->pid);
 									
@@ -1768,30 +1911,23 @@ ServerLoop(void)
 								{
 									if (closesocket(s.sock) != 0)
 										elog(LOG, "could not close client socket: %m");
-									
+
 									/* Skip creating a new backend */
 									continue;
 								}
-								else
-								{
-									/*
-									 * Socket passing failed. This could happen if:
-									 * - Socket passing mechanism is not yet implemented
-									 * - Backend died or is no longer in the pool
-									 * - Socket passing error occurred
-									 * 
-									 * Fall back to creating a new backend.
-									 */
-									elog(DEBUG2, "failed to assign connection to idle backend (pid=%d), creating new backend",
-										 (int) idle_backend->pid);
-									/* Fall through to create new backend */
-								}
+								/* Fall through to create new backend */
+								elog(DEBUG2, "failed to assign connection to idle backend (pid=%d), creating new backend",
+										(int) idle_backend->pid);
+							}
+							else
+							{
+								signal_child(idle_backend, SIGTERM);
 							}
 						}
 					}
 					
 					/* Create new backend (or reuse if pool assignment was successful) */
-					BackendStartup(&s);
+					BackendStartup(&s, target_dbname, db_hash);
 				}
 
 				/* We no longer need the open socket in this process */
@@ -3663,7 +3799,7 @@ TerminateChildren(int signal)
  * StartBackgroundWorker.
  */
 static int
-BackendStartup(ClientSocket *client_sock)
+BackendStartup(ClientSocket *client_sock, const char *target_dbname, uint64 db_hash)
 {
 	PMChild    *bn = NULL;
 	pid_t		pid;
@@ -3715,6 +3851,13 @@ BackendStartup(ClientSocket *client_sock)
 		startup_data.pmchild_ptr = (uintptr_t) bn;
 	else
 		startup_data.pmchild_ptr = 0;
+
+	if (enable_connection_pool && bn != NULL && bn->child_slot > 0 &&
+		target_dbname != NULL && target_dbname[0] != '\0' && db_hash != 0)
+	{
+		strlcpy(bn->last_dbname, target_dbname, sizeof(bn->last_dbname));
+		bn->last_db_hash = db_hash;
+	}
 	
 	bn->rw = NULL;
 

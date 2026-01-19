@@ -4858,6 +4858,19 @@ InitializeSearchPath(void)
 	}
 }
 
+void
+InitializeSearchPathForReuse(void)
+{
+	if (IsBootstrapProcessingMode())
+	{
+		InitializeSearchPath();
+		return;
+	}
+
+	baseSearchPathValid = false;
+	searchPathCacheValid = false;
+}
+
 /*
  * InvalidationCallback
  *		Syscache inval callback function

@@ -14,13 +14,18 @@ LockFreeSlotQueueInit(LockFreeSlotQueue *queue, uint32 capacity, PoolSlotEntry *
     if (queue == NULL || shared_entries == NULL)
         return false;
 
-    pg_atomic_init_u32(&queue->head, 0);
-    pg_atomic_init_u32(&queue->tail, 0);
+    pg_atomic_init_u64(&queue->head, 0);
+    pg_atomic_init_u64(&queue->tail, 0);
     queue->capacity = capacity;
     queue->entries = shared_entries;
 
     /* Clear the entries array (pmchild_ptr = 0 means empty) */
-    MemSet(shared_entries, 0, sizeof(PoolSlotEntry) * capacity);
+    for (uint32 i = 0; i < capacity; i++)
+    {
+        pg_atomic_init_u64(&shared_entries[i].seq, i);
+        pg_atomic_init_u64(&shared_entries[i].pmchild_ptr, 0);
+        shared_entries[i].idle_since = 0;
+    }
 
     return true;
 }
@@ -31,7 +36,7 @@ LockFreeSlotQueueEnqueue(LockFreeSlotQueue *queue,
                          TimestampTz idle_since,
                          uint32 current_max_pool_size)
 {
-    uint32 tail, next_tail, head;
+    uint64 pos;
 
     if (queue == NULL || queue->entries == NULL)
         return false;
@@ -39,131 +44,116 @@ LockFreeSlotQueueEnqueue(LockFreeSlotQueue *queue,
     if (pmchild_ptr == 0)
         return false;
 
-    /* Note: We cannot check child_slot here because PMChild* points to
-     * postmaster's private memory, which backend processes cannot access.
-     * The check is done in PoolGetIdleBackend() when postmaster dequeues.
-     */
+    (void) current_max_pool_size;
 
     for (;;)
     {
-        tail = pg_atomic_read_u32(&queue->tail);
-        head = pg_atomic_read_u32(&queue->head);
+        PoolSlotEntry *cell;
+        uint64 seq;
+        int64 dif;
 
-        next_tail = tail + 1;
-        if(next_tail >= queue->capacity)
-            next_tail = 0;
+        pos = pg_atomic_read_u64(&queue->tail);
+        cell = &queue->entries[pos % queue->capacity];
+        seq = pg_atomic_read_u64(&cell->seq);
+        dif = (int64) seq - (int64) pos;
 
-        /* Check if full (one slot always left unused) */
-        if (next_tail == head)
+        if (dif == 0)
         {
-            elog(DEBUG2, "slot queue is full (pmchild_ptr=%p)", (void *)pmchild_ptr);
+            if (pg_atomic_compare_exchange_u64(&queue->tail, &pos, pos + 1))
+                break;
+        }
+        else if (dif < 0)
+        {
             return false;
         }
 
-        /* Try to claim the tail slot */
-        if (pg_atomic_compare_exchange_u32(&queue->tail, &tail, next_tail))
-        {
-            /*
-             * Successfully claimed position 'tail'.
-             * Write the entry (pmchild_ptr and timestamp) atomically.
-             * pg_write_barrier() ensures visibility to consumer.
-             */
-            queue->entries[tail].pmchild_ptr = pmchild_ptr;
-            queue->entries[tail].idle_since = idle_since;
-            pg_write_barrier(); /* release semantics */
-
-            elog(DEBUG3, "enqueued PMChild* %p at index %u (idle_since=%ld)",
-                 (void *)pmchild_ptr, tail, (long) idle_since);
-            return true;
-        }
-
-        /* CAS failed due to contention, retry */
         pg_spin_delay();
     }
+
+    {
+        PoolSlotEntry *cell = &queue->entries[pos % queue->capacity];
+
+        cell->idle_since = idle_since;
+        pg_atomic_write_u64(&cell->pmchild_ptr, (uint64) pmchild_ptr);
+        pg_atomic_write_membarrier_u64(&cell->seq, pos + 1);
+    }
+
+    return true;
 }
 
 PMChild *
 LockFreeSlotQueuePeek(LockFreeSlotQueue *queue, TimestampTz *idle_since)
 {
-    uint32 head, tail;
-    uintptr_t pmchild_ptr;
-    PMChild *pmchild;
+    uint64 pos;
+    PoolSlotEntry *cell;
+    uint64 seq;
+    int64 dif;
+    uint64 pmchild_ptr;
 
     if (queue == NULL || queue->entries == NULL)
         return NULL;
 
-    head = pg_atomic_read_u32(&queue->head);
-    tail = pg_atomic_read_u32(&queue->tail);
+    pos = pg_atomic_read_u64(&queue->head);
+    cell = &queue->entries[pos % queue->capacity];
+    seq = pg_atomic_read_membarrier_u64(&cell->seq);
+    dif = (int64) seq - (int64) (pos + 1);
 
-    /* Check if empty */
-    if (head == tail)
+    if (dif != 0)
         return NULL;
-
-    /*
-     * Single consumer: we own 'head', no need for CAS.
-     * Read the entry (pmchild_ptr and timestamp) without removing it.
-     */
-    pg_read_barrier(); /* acquire semantics */
-    pmchild_ptr = queue->entries[head].pmchild_ptr;
     
     /* Return timestamp if requested */
     if (idle_since != NULL)
-        *idle_since = queue->entries[head].idle_since;
+        *idle_since = cell->idle_since;
 
-    /* Convert uintptr_t back to PMChild* */
-    pmchild = (PMChild *) pmchild_ptr;
+    pmchild_ptr = pg_atomic_read_u64(&cell->pmchild_ptr);
 
-    elog(DEBUG3, "peeked PMChild* %p from index %u (idle_since=%ld)",
-         (void *)pmchild_ptr, head, idle_since ? (long) *idle_since : 0);
-    return pmchild;
+    return (PMChild *) ((uintptr_t) pmchild_ptr);
 }
 
 PMChild *
 LockFreeSlotQueueDequeue(LockFreeSlotQueue *queue, TimestampTz *idle_since)
 {
-    uint32 head, tail;
-    uintptr_t pmchild_ptr;
-    PMChild *pmchild;
+    uint64 pos;
+    PoolSlotEntry *cell;
+    uint64 seq;
+    int64 dif;
+    uint64 pmchild_ptr;
     TimestampTz enqueue_since;
 
     if (queue == NULL || queue->entries == NULL)
         return NULL;
 
-    head = pg_atomic_read_u32(&queue->head);
-    tail = pg_atomic_read_u32(&queue->tail);
-
-    /* Check if empty */
-    if (head == tail)
-        return NULL;
-
-    /*
-     * Single consumer: we own 'head', no need for CAS.
-     * Read the entry (pmchild_ptr and timestamp).
-     */
-    pg_read_barrier(); /* acquire semantics */
-    pmchild_ptr = queue->entries[head].pmchild_ptr;
-    enqueue_since = queue->entries[head].idle_since;
-    
-    /* Return timestamp if requested */
-    if (idle_since != NULL)
-        *idle_since = queue->entries[head].idle_since;
-
-    /* Clear the entry for reuse */
-    queue->entries[head].pmchild_ptr = 0;
-    queue->entries[head].idle_since = 0;
-
-    /* Advance head */
+    for (;;)
     {
-        uint32 next_head = head + 1;
-        if(next_head >= queue->capacity)
-            next_head = 0;
-        pg_atomic_write_u32(&queue->head, next_head);
+        pos = pg_atomic_read_u64(&queue->head);
+        cell = &queue->entries[pos % queue->capacity];
+		seq = pg_atomic_read_membarrier_u64(&cell->seq);
+        dif = (int64) seq - (int64) (pos + 1);
+
+        if (dif == 0)
+        {
+            if (pg_atomic_compare_exchange_u64(&queue->head, &pos, pos + 1))
+                break;
+        }
+        else if (dif < 0)
+        {
+            return NULL;
+        }
+
+        pg_spin_delay();
     }
 
-    /* Convert uintptr_t back to PMChild* */
-    pmchild = (PMChild *) pmchild_ptr;
+    enqueue_since = cell->idle_since;
 
-    elog(DEBUG3, "dequeued PMChild* %p from index %u (idle_since=%ld)",
-         (void *)pmchild_ptr, head, (long) enqueue_since);
-    return pmchild;
+    /* Return timestamp if requested */
+    if (idle_since != NULL)
+        *idle_since = enqueue_since;
+
+    pmchild_ptr = pg_atomic_read_u64(&cell->pmchild_ptr);
+
+    cell->idle_since = 0;
+    pg_atomic_write_u64(&cell->pmchild_ptr, 0);
+    pg_atomic_write_membarrier_u64(&cell->seq, pos + queue->capacity);
+
+    return (PMChild *) ((uintptr_t) pmchild_ptr);
 }

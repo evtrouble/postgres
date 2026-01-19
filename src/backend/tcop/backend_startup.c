@@ -19,6 +19,7 @@
 
 #include "access/xlog.h"
 #include "access/xlogrecovery.h"
+#include "access/xact.h"
 #include "common/ip.h"
 #include "common/string.h"
 #include "libpq/libpq.h"
@@ -40,11 +41,14 @@
 #include "utils/builtins.h"
 #include "utils/guc_hooks.h"
 #include "utils/injection_point.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/resowner.h"
+#include "utils/snapmgr.h"
 #include "utils/timeout.h"
 #include "utils/varlena.h"
+#include "commands/discard.h"
 
 /* GUCs */
 bool		Trace_connection_negotiation = false;
@@ -87,58 +91,79 @@ extern bool enable_connection_pool;
 static void
 ResetBackendForReuse(void)
 {
-    /* Transaction cleanup */
-    ReuseProcExitCleanup();
+	/* Transaction cleanup */
+	ReuseProcExitCleanup();
 
-    /* Release (and warn about) any buffer pins leaked */
-    if (AuxProcessResourceOwner != NULL)
-        ReleaseAuxProcessResources(true);
-    CurrentResourceOwner = NULL;
+	{
+		DiscardStmt stmt;
 
-    /* Communication reset */
-    whereToSendOutput = DestNone;
+		if (IsTransactionOrTransactionBlock())
+			AbortOutOfAnyTransaction();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		memset(&stmt, 0, sizeof(DiscardStmt));
+		stmt.target = DISCARD_ALL;
+		DiscardCommand(&stmt, true);
+
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
+
+	/* Release (and warn about) any buffer pins leaked */
+	if (AuxProcessResourceOwner != NULL)
+		ReleaseAuxProcessResources(true);
+	CurrentResourceOwner = NULL;
+
+	/* Communication reset */
+	whereToSendOutput = DestNone;
 	/* 旧 socket 的传输层由 socket_close 回调 secure_close；不在此显式 close */
 
-    /* Timeouts */
-    disable_all_timeouts(false);
+	/* Timeouts */
+	disable_all_timeouts(false);
 
-    /* Interrupt flags */
-    CheckClientConnectionPending = false;
-    ClientConnectionLost = false;
-    IdleInTransactionSessionTimeoutPending = false;
-    TransactionTimeoutPending = false;
-    IdleSessionTimeoutPending = false;
-    IdleStatsUpdateTimeoutPending = false;
+	/* Interrupt flags */
+	CheckClientConnectionPending = false;
+	ClientConnectionLost = false;
+	IdleInTransactionSessionTimeoutPending = false;
+	TransactionTimeoutPending = false;
+	IdleSessionTimeoutPending = false;
+	IdleStatsUpdateTimeoutPending = false;
 
-    /* Holdoff counters */
-    QueryCancelHoldoffCount = 0;
+	/* Holdoff counters */
+	QueryCancelHoldoffCount = 0;
+	InterruptHoldoffCount = 0;
+	CritSectionCount = 0;
 
-    /* Latch */
-    if (MyLatch)
-        ResetLatch(MyLatch);
+	/* Latch */
+	if (MyLatch)
+		ResetLatch(MyLatch);
 
-    /* Error context */
-    PG_exception_stack = NULL;
+	/* Error context */
+	PG_exception_stack = NULL;
 
-    /* Reset session state */
-    ClientAuthInProgress = true;
+	/* Reset session state */
+	ClientAuthInProgress = true;
 
-    /* Reset GUC options to defaults */
-    ResetAllOptions();
-    ResetGUCReporting();
+	/* Reset GUC reporting state */
+	ResetGUCReporting();
 	if (FeBeWaitSet)
-    {
-        FreeWaitEventSet(FeBeWaitSet);
-        FeBeWaitSet = NULL;
-    }
+	{
+		FreeWaitEventSet(FeBeWaitSet);
+		FeBeWaitSet = NULL;
+	}
 
-    AtEOXact_RelationCache(false); // 清理事务级 relcache 引用
-    RelationCacheInvalidate(false);
-    AtEOXact_HashTables(false);     // 清理 plan cache 等
-    /* Reset memory contexts used per-connection (handled by exit callbacks) */
+	/* Reset memory contexts used per-connection (handled by exit callbacks) */
 
-    /* Update ps display */
-    set_ps_display("idle");
+	/* Update ps display */
+	if (MyProcPort)
+	{
+		StringInfoData ps_data;
+		initStringInfo(&ps_data);
+		init_ps_display(ps_data.data);
+		pfree(ps_data.data);
+	}
+	set_ps_display("idle");
 }
 
 /*
@@ -241,6 +266,8 @@ BackendMain(const void *startup_data, size_t startup_data_len)
 			elog(DEBUG2, "backend (pid=%d) returned to connection pool, waiting for reuse",
 						(int) MyProcPid);
 			receive_socket_from_postmaster(MyClientSocket);
+			if (ProcDiePending || MyClientSocket->sock == PGINVALID_SOCKET)
+				proc_exit(0);
 			BackendInitializeForReuse(MyClientSocket);
 		}
 	} else {
@@ -440,6 +467,8 @@ BackendInitializeForReuse(ClientSocket *client_sock)
 	pfree(ps_data.data);
 
 	set_ps_display("initializing");
+	pqsignal(SIGTERM, die);
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 }
 
 /*

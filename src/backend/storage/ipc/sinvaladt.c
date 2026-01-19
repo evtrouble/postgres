@@ -335,6 +335,19 @@ CleanupInvalidationState(int status, Datum arg)
 
 	LWLockAcquire(SInvalWriteLock, LW_EXCLUSIVE);
 
+	for (i = segP->numProcs - 1; i >= 0; i--)
+	{
+		if (segP->pgprocnos[i] == MyProcNumber)
+			break;
+	}
+	if (i < 0)
+	{
+		elog(DEBUG3, "CleanupInvalidationState: MyProcNumber %d not active for pid %d",
+			 MyProcNumber, MyProcPid);
+		LWLockRelease(SInvalWriteLock);
+		return;
+	}
+
 	stateP = &segP->procState[MyProcNumber];
 
 	/* Update next local transaction ID for next holder of this proc number */
@@ -346,17 +359,8 @@ CleanupInvalidationState(int status, Datum arg)
 	stateP->resetState = false;
 	stateP->signaled = false;
 
-	for (i = segP->numProcs - 1; i >= 0; i--)
-	{
-		if (segP->pgprocnos[i] == MyProcNumber)
-		{
-			if (i != segP->numProcs - 1)
-				segP->pgprocnos[i] = segP->pgprocnos[segP->numProcs - 1];
-			break;
-		}
-	}
-	if (i < 0)
-		elog(PANIC, "could not find entry in sinval array");
+	if (i != segP->numProcs - 1)
+		segP->pgprocnos[i] = segP->pgprocnos[segP->numProcs - 1];
 	segP->numProcs--;
 
 	LWLockRelease(SInvalWriteLock);

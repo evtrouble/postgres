@@ -1678,10 +1678,10 @@ ReusePostgres(const char *in_dbname, Oid dboid,
 	 * Load relcache entries for the system catalogs.  This must create at
 	 * least the minimum set of "nailed-in" cache entries.
 	 */
-	RelationCacheInitializePhase3();
+	// RelationCacheInitializePhase3();
 
 	/* set up ACL framework (so CheckMyDatabase can check permissions) */
-	initialize_acl();
+	initialize_acl_for_reuse();
 
 	/*
 	 * Re-read the pg_database row for our database, check permissions and set
@@ -1714,7 +1714,7 @@ ReusePostgres(const char *in_dbname, Oid dboid,
 	 */
 
 	/* set default namespace search path */
-	InitializeSearchPath();
+	InitializeSearchPathForReuse();
 
 	/* initialize client encoding */
 	InitializeClientEncoding();

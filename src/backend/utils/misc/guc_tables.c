@@ -532,6 +532,9 @@ bool		check_function_bodies = true;
 bool		enable_connection_pool = false;
 int			connection_pool_size = 10;
 int			connection_pool_idle_timeout = 300;	/* seconds */
+int			connection_pool_min_idle_size = 0;
+char	   *connection_pool_socket_dir;
+char	   *connection_pool_socket_file_prefix;
 
 /*
  * This GUC exists solely for backward compatibility, check its definition for

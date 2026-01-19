@@ -46,9 +46,10 @@ typedef struct
 	struct RegisteredBgWorker *rw;	/* bgworker info, if this is a bgworker */
 	bool		bgworker_notify;	/* gets bgworker start/stop notifications */
 	dlist_node	elem;			/* list link in ActiveChildList */
-	// CONNECTION TODO: 初始化
 	Latch	   *procLatch;		/* pointer to PGPROC->procLatch in shared memory */
 	int         control_fd;
+	char        last_dbname[NAMEDATALEN];
+	uint64      last_db_hash;
 } PMChild;
 
 #ifdef EXEC_BACKEND

@@ -26,10 +26,10 @@ extern void InitConnectionPool(void);
 extern void ConfigureConnectionPool(void);
 extern void PoolAddBackend(PMChild *pmchild);
 extern PMChild *PoolGetIdleBackend(void);
+extern PMChild *PoolGetIdleBackendByDbName(const char *dbname, uint64 db_hash);
 extern void PoolCleanupExpired(void);
 extern void PoolGetStats(int *current_size, int *max_size, int *idle_count);
 
 /* Lock-free queue functions (can be called from backend processes) */
 extern bool PoolEnqueuePMChild(uintptr_t pmchild_ptr);
 #endif							/* CONNECTION_POOL_H */
-

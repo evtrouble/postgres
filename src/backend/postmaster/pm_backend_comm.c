@@ -12,6 +12,9 @@
 #include "storage/shmem.h"
 #include "miscadmin.h"
 
+extern char *connection_pool_socket_dir;
+extern char *connection_pool_socket_file_prefix;
+
 /*
  * Send a new client socket to an idle backend (for connection pool reuse)
  *
@@ -45,7 +48,7 @@ send_socket_to_backend(PMChild *pmchild, ClientSocket *client_sock)
         struct sockaddr_un addr;
 
         snprintf(sock_path, sizeof(sock_path),
-                 POOL_BACKEND_SOCKET_FORMAT, (int)pmchild->pid);
+                 "%s/%s.%d", connection_pool_socket_dir, connection_pool_socket_file_prefix, (int)pmchild->pid);
 
         fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0)
@@ -291,11 +294,11 @@ cleanup_pool_backend_socket(int code, Datum arg)
     {
         closesocket(MyControlFd);
         MyControlFd = -1;
-
-        snprintf(sock_path, sizeof(sock_path),
-                 POOL_BACKEND_SOCKET_FORMAT, (int)MyProcPid);
-        unlink(sock_path);
     }
+    
+    snprintf(sock_path, sizeof(sock_path),
+                "%s/%s.%d", connection_pool_socket_dir, connection_pool_socket_file_prefix, (int)MyProcPid);
+    unlink(sock_path);
 }
 
 void
@@ -307,7 +310,7 @@ init_pool_backend_socket(void)
 
     /* 生成固定路径 */
     snprintf(sock_path, sizeof(sock_path),
-             POOL_BACKEND_SOCKET_FORMAT, (int)MyProcPid);
+             "%s/%s.%d", connection_pool_socket_dir, connection_pool_socket_file_prefix, (int)MyProcPid);
 
     /* 创建 Unix socket */
     MyListenFd = socket(AF_UNIX, SOCK_STREAM, 0);

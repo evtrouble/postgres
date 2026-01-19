@@ -13,7 +13,6 @@
 #ifndef _PM_BACKEND_COMM_H
 #define _PM_BACKEND_COMM_H
 
-#include "postmaster/postmaster.h"
 #include "libpq/libpq-be.h"
 
 extern bool send_socket_to_backend(PMChild *pmchild, ClientSocket *client_sock);

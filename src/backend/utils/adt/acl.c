@@ -5062,6 +5062,17 @@ initialize_acl(void)
 	}
 }
 
+void
+initialize_acl_for_reuse(void)
+{
+	if (!IsBootstrapProcessingMode())
+	{
+		cached_db_hash =
+			GetSysCacheHashValue1(DATABASEOID,
+								  ObjectIdGetDatum(MyDatabaseId));
+	}
+}
+
 /*
  * RoleMembershipCacheCallback
  *		Syscache inval callback function

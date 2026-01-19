@@ -43,6 +43,8 @@
 #include "utils/memutils.h"
 #include "utils/varlena.h"
 
+extern bool enable_connection_pool;
+
 #ifdef USE_LDAP
 #ifdef WIN32
 #include <winldap.h>
@@ -92,6 +94,19 @@ static MemoryContext parsed_hba_context = NULL;
  */
 static List *parsed_ident_lines = NIL;
 static MemoryContext parsed_ident_context = NULL;
+
+static MemoryContext auth_files_context = NULL;
+
+static MemoryContext
+GetAuthFilesContext(void)
+{
+	if (auth_files_context == NULL)
+		auth_files_context = AllocSetContextCreate(TopMemoryContext,
+												  "AuthFileContext",
+												  ALLOCSET_SMALL_SIZES);
+
+	return auth_files_context;
+}
 
 /*
  * The following character array represents the names of the authentication
@@ -2662,10 +2677,21 @@ load_hba(void)
 	tokenize_auth_file(HbaFileName, file, &hba_lines, LOG, 0);
 
 	/* Now parse all the lines */
-	Assert(PostmasterContext);
-	hbacxt = AllocSetContextCreate(PostmasterContext,
+	{
+		MemoryContext parentcxt;
+
+		if (enable_connection_pool)
+			parentcxt = GetAuthFilesContext();
+		else
+		{
+			Assert(PostmasterContext);
+			parentcxt = PostmasterContext;
+		}
+
+		hbacxt = AllocSetContextCreate(parentcxt,
 								   "hba parser context",
 								   ALLOCSET_SMALL_SIZES);
+	}
 	oldcxt = MemoryContextSwitchTo(hbacxt);
 	foreach(line, hba_lines)
 	{
@@ -3058,10 +3084,21 @@ load_ident(void)
 	tokenize_auth_file(IdentFileName, file, &ident_lines, LOG, 0);
 
 	/* Now parse all the lines */
-	Assert(PostmasterContext);
-	ident_context = AllocSetContextCreate(PostmasterContext,
+	{
+		MemoryContext parentcxt;
+
+		if (enable_connection_pool)
+			parentcxt = GetAuthFilesContext();
+		else
+		{
+			Assert(PostmasterContext);
+			parentcxt = PostmasterContext;
+		}
+
+		ident_context = AllocSetContextCreate(parentcxt,
 										  "ident parser context",
 										  ALLOCSET_SMALL_SIZES);
+	}
 	oldcxt = MemoryContextSwitchTo(ident_context);
 	foreach(line_cell, ident_lines)
 	{

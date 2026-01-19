@@ -228,6 +228,7 @@ extern void select_best_grantor(Oid roleId, AclMode privileges,
 								Oid *grantorId, AclMode *grantOptions);
 
 extern void initialize_acl(void);
+extern void initialize_acl_for_reuse(void);
 
 /*
  * prototypes for functions in aclchk.c

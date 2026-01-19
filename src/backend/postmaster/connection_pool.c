@@ -72,6 +72,7 @@ typedef struct ConnectionPoolShmem
 	int			max_pool_size;		/* Maximum pool size (from GUC) */
 	int			current_pool_size;	/* Current number of backends in pool */
 	int			idle_timeout;		/* Idle timeout in seconds (from GUC) */
+	int			min_idle_size;		/* Minimum idle backends to keep */
 } ConnectionPoolShmem;
 
 /* Pointer to shared memory structure */
@@ -83,6 +84,7 @@ static int timeout_count = 0;				/* Consecutive timeout checks for queue head */
 /* GUC variables - accessed directly */
 extern int connection_pool_size;
 extern int connection_pool_idle_timeout;
+extern int connection_pool_min_idle_size;
 
 /*
  * Calculate shared memory size needed for connection pool
@@ -142,6 +144,7 @@ ConnectionPoolShmemInit(void)
 		pool_shmem->max_pool_size = connection_pool_size;
 		pool_shmem->current_pool_size = 0;
 		pool_shmem->idle_timeout = connection_pool_idle_timeout;
+		pool_shmem->min_idle_size = connection_pool_min_idle_size;
 	}
 	
 	/* Calculate queue capacity using the same formula as ConnectionPoolShmemSize()
@@ -211,6 +214,7 @@ ConfigureConnectionPool(void)
 	{
 		pool_shmem->max_pool_size = connection_pool_size;
 		pool_shmem->idle_timeout = connection_pool_idle_timeout;
+		pool_shmem->min_idle_size = connection_pool_min_idle_size;
 	}
 	
 	elog(DEBUG1, "connection pool configured (max_size=%d, idle_timeout=%d)",
@@ -325,6 +329,60 @@ PoolGetIdleBackend(void)
 	return LockFreeSlotQueueDequeue(pool_shmem->queue, NULL);
 }
 
+PMChild *
+PoolGetIdleBackendByDbName(const char *dbname, uint64 db_hash)
+{
+	LockFreeSlotQueue *queue;
+	PMChild	   *pmchild = NULL;
+	uint64		head;
+	uint64		tail;
+	uint32		scan_count;
+
+	if (pool_shmem == NULL || pool_shmem->queue == NULL)
+		return NULL;
+
+	queue = pool_shmem->queue;
+
+	if (dbname == NULL || dbname[0] == '\0' || db_hash == 0)
+		return NULL;
+
+	head = pg_atomic_read_u64(&queue->head);
+	tail = pg_atomic_read_u64(&queue->tail);
+
+	if (tail <= head)
+		scan_count = 0;
+	else
+	{
+		uint64 avail = tail - head;
+		if (avail > queue->capacity)
+			avail = queue->capacity;
+		scan_count = (uint32) avail;
+	}
+
+	if (scan_count == 0)
+		return NULL;
+
+	for (uint32 i = 0; i < scan_count; i++)
+	{
+		TimestampTz idle_since;
+
+		pmchild = LockFreeSlotQueueDequeue(queue, &idle_since);
+		if (pmchild == NULL)
+			break;
+
+		if (pmchild->last_db_hash == db_hash && strcmp(pmchild->last_dbname, dbname) == 0)
+			return pmchild;
+
+		if (!LockFreeSlotQueueEnqueue(queue,
+									  (uintptr_t) pmchild,
+									  idle_since,
+									  pool_shmem->max_pool_size))
+			SignalBackendToExit(pmchild);
+	}
+
+	return NULL;
+}
+
 /*
  * Clean up expired backends from the pool (dynamic pool shrinking)
  *
@@ -340,6 +398,11 @@ PoolGetIdleBackend(void)
 void
 PoolCleanupExpired(void)
 {
+	LockFreeSlotQueue *queue;
+	uint64		head;
+	uint64		tail;
+	int			idle_count = 0;
+	int			min_idle_size;
 	TimestampTz now;
 	TimestampTz idle_since;
 	PMChild    *pmchild;
@@ -347,9 +410,33 @@ PoolCleanupExpired(void)
 	
 	if (pool_shmem == NULL || pool_shmem->queue == NULL)
 		return;
+
+	queue = pool_shmem->queue;
 	
 	if (pool_shmem->idle_timeout <= 0)
 		return; /* Timeout disabled */
+
+	min_idle_size = pool_shmem->min_idle_size;
+	if (min_idle_size < 0)
+		min_idle_size = 0;
+	if (min_idle_size > pool_shmem->max_pool_size)
+		min_idle_size = pool_shmem->max_pool_size;
+
+	head = pg_atomic_read_u64(&queue->head);
+	tail = pg_atomic_read_u64(&queue->tail);
+	if (tail > head)
+	{
+		uint64 avail = tail - head;
+		if (avail > queue->capacity)
+			avail = queue->capacity;
+		idle_count = (int) avail;
+	}
+
+	if (idle_count <= min_idle_size)
+	{
+		timeout_count = 0;
+		return;
+	}
 	
 	now = GetCurrentTimestamp();
 	
@@ -384,10 +471,7 @@ PoolCleanupExpired(void)
 			{
 				/* Send exit signal to the backend */
 				SignalBackendToExit(pmchild);
-				
-				/* Remove from ActiveChildList and release slot */
-				ReleasePostmasterChildSlot(pmchild);
-				
+
 				elog(LOG, "removed expired backend (pid=%d, slot=%d) from connection pool "
 					 "(idle %ld seconds, %d consecutive timeout checks)",
 					 (int) pmchild->pid, pmchild->child_slot,
@@ -413,8 +497,8 @@ void
 PoolGetStats(int *current_size, int *max_size, int *idle_count)
 {
 	LockFreeSlotQueue *queue;
-	uint32		head;
-	uint32		tail;
+	uint64		head;
+	uint64		tail;
 	int			count = 0;
 	
 	if (pool_shmem == NULL)
@@ -431,13 +515,15 @@ PoolGetStats(int *current_size, int *max_size, int *idle_count)
 	if (pool_shmem->queue != NULL)
 	{
 		queue = pool_shmem->queue;
-		head = pg_atomic_read_u32(&queue->head);
-		tail = pg_atomic_read_u32(&queue->tail);
-		
-		if (tail >= head)
-			count = tail - head;
-		else
-			count = queue->capacity - head + tail;
+		head = pg_atomic_read_u64(&queue->head);
+		tail = pg_atomic_read_u64(&queue->tail);
+		if (tail > head)
+		{
+			uint64 avail = tail - head;
+			if (avail > queue->capacity)
+				avail = queue->capacity;
+			count = (int) avail;
+		}
 	}
 	
 	*idle_count = count;

@@ -1110,6 +1110,15 @@
   max => 'MAX_BACKENDS',
 },
 
+{ name => 'connection_pool_min_idle_size', type => 'int', context => 'PGC_SIGHUP', group => 'CONN_AUTH_SETTINGS',
+  short_desc => 'Sets the minimum number of idle backend processes to keep in the connection pool.',
+  long_desc => 'Expired idle backends will not be terminated if doing so would reduce the number of idle backends below this value. This parameter can be changed at runtime by reloading the configuration file.',
+  variable => 'connection_pool_min_idle_size',
+  boot_val => '0',
+  min => '0',
+  max => 'MAX_BACKENDS',
+},
+
 { name => 'connection_pool_idle_timeout', type => 'int', context => 'PGC_SIGHUP', group => 'CONN_AUTH_SETTINGS',
   short_desc => 'Sets the idle timeout in seconds for backend processes in the connection pool.',
   long_desc => 'Backend processes that remain idle in the pool longer than this timeout will be terminated. A value of 0 disables timeout. This parameter can be changed at runtime by reloading the configuration file.',
@@ -1117,6 +1126,20 @@
   boot_val => '300',
   min => '0',
   max => 'INT_MAX',
+},
+
+{ name => 'connection_pool_socket_dir', type => 'string', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_SETTINGS',
+  short_desc => 'Sets the directory for the connection pool backend socket.',
+  long_desc => 'Specifies the directory where the Unix domain socket for the connection pool backend will be created. This parameter requires a server restart to take effect.',
+  variable => 'connection_pool_socket_dir',
+  boot_val => '"/tmp"',
+},
+
+{ name => 'connection_pool_socket_file_prefix', type => 'string', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_SETTINGS',
+  short_desc => 'Sets the file prefix for the connection pool backend socket.',
+  long_desc => 'Specifies the file name prefix for the Unix domain socket. The process ID will be appended to this prefix. This parameter requires a server restart to take effect.',
+  variable => 'connection_pool_socket_file_prefix',
+  boot_val => '".s.PGSQL.pool"',
 },
 
 { name => 'min_dynamic_shared_memory', type => 'int', context => 'PGC_POSTMASTER', group => 'RESOURCES_MEM',

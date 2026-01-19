@@ -158,6 +158,8 @@ InitPostmasterChildSlots(void)
 			slots[slotno].bgworker_notify = false;
 			slots[slotno].procLatch = NULL;
 			slots[slotno].control_fd = -1;
+			slots[slotno].last_dbname[0] = '\0';
+			slots[slotno].last_db_hash = 0;
 			dlist_push_tail(&pmchild_pools[btype].freelist, &slots[slotno].elem);
 			slotno++;
 		}
@@ -195,6 +197,9 @@ AssignPostmasterChildSlot(BackendType btype)
 	pmchild->rw = NULL;
 	pmchild->bgworker_notify = true;
 	pmchild->procLatch = NULL;	/* Will be set after backend calls InitProcess() */
+	pmchild->control_fd = -1;
+	pmchild->last_dbname[0] = '\0';
+	pmchild->last_db_hash = 0;
 
 	/*
 	 * pmchild->child_slot for each entry was initialized when the array of
@@ -238,6 +243,10 @@ AllocDeadEndChild(void)
 		pmchild->bkend_type = B_DEAD_END_BACKEND;
 		pmchild->rw = NULL;
 		pmchild->bgworker_notify = false;
+		pmchild->procLatch = NULL;
+		pmchild->control_fd = -1;
+		pmchild->last_dbname[0] = '\0';
+		pmchild->last_db_hash = 0;
 
 		dlist_push_head(&ActiveChildList, &pmchild->elem);
 	}
@@ -266,6 +275,12 @@ ReleasePostmasterChildSlot(PMChild *pmchild)
 		PMChildPool *pool;
 
 		elog(DEBUG2, "releasing pm child slot %d", pmchild->child_slot);
+
+		if (pmchild->control_fd >= 0)
+		{
+			closesocket(pmchild->control_fd);
+			pmchild->control_fd = -1;
+		}
 
 		/* WAL senders start out as regular backends, and share the pool */
 		if (pmchild->bkend_type == B_WAL_SENDER)
