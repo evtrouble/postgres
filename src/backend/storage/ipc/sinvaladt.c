@@ -396,9 +396,9 @@ SharedInvalBackendInitForReuse(bool sendOnly)
 
 	stateP->procPid = MyProcPid;
 	stateP->nextMsgNum = segP->maxMsgNum;
-	stateP->resetState = false;
+	stateP->resetState = true;
 	stateP->signaled = false;
-	stateP->hasMessages = false;
+	stateP->hasMessages = true;
 	stateP->sendOnly = sendOnly;
 
 	LWLockRelease(SInvalWriteLock);
