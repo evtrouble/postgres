@@ -77,6 +77,7 @@
 #include "miscadmin.h"
 #include "port/pg_bswap.h"
 #include "postmaster/postmaster.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "utils/guc_hooks.h"
 #include "utils/memutils.h"
@@ -542,7 +543,10 @@ socket_close(int code, Datum arg)
 		 * free resources before the backend continues running.
 		 */
 		if (is_reuse_cleanup && MyProcPort->sock != PGINVALID_SOCKET)
+		{
 			closesocket(MyProcPort->sock);
+			ReleaseExternalFD();
+		}
 
 		/*
 		 * Formerly we did an explicit close() here, but it seems better to

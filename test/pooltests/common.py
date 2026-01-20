@@ -13,6 +13,8 @@ class PoolTestContext:
         self.cycles = int(os.environ.get("POOLTEST_CYCLES", "200"))
         self.rss_max_delta_kb = int(os.environ.get("POOLTEST_RSS_MAX_DELTA_KB", "20480"))
         self.rss_warmup = int(os.environ.get("POOLTEST_RSS_WARMUP", "10"))
+        self.mcxt_max_delta_bytes = int(os.environ.get("POOLTEST_MCXT_MAX_DELTA_BYTES", str(100 * 1024 * 1024)))
+        self.mcxt_warmup = int(os.environ.get("POOLTEST_MCXT_WARMUP", str(self.rss_warmup)))
 
     def get_psql_cmd(self):
         if "PSQL_PATH" in os.environ:
@@ -95,6 +97,32 @@ class PoolTestContext:
             return None
 
         return None
+
+    def can_read_backend_memory_contexts(self):
+        res = self.run_psql("SELECT 1 FROM pg_backend_memory_contexts LIMIT 1;", allow_error=True)
+        return res is not None and res["returncode"] == 0
+
+    def get_backend_memory_context_totals(self):
+        res = self.run_psql(
+            "SELECT sum(total_bytes)::bigint, sum(used_bytes)::bigint FROM pg_backend_memory_contexts;",
+            allow_error=True,
+        )
+        if res is None or res["returncode"] != 0:
+            return None
+
+        line = first_nonempty_line(res["stdout"] or "")
+        if not line:
+            return None
+
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) != 2:
+            return None
+
+        total_s, used_s = parts
+        if not total_s.lstrip("-").isdigit() or not used_s.lstrip("-").isdigit():
+            return None
+
+        return int(total_s), int(used_s)
 
 
 def first_nonempty_line(s):
