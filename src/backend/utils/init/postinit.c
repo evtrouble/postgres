@@ -59,6 +59,7 @@
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/guc_hooks.h"
 #include "utils/injection_point.h"
@@ -1270,20 +1271,19 @@ ReusePostgres(const char *in_dbname, Oid dboid,
 
 	ProcSignalInitForReuse(MyCancelKey, MyCancelKeyLength);
 
-	/* timeouts are registered once in InitPostgres; reuse sessions only reuse them */
-	// if (!bootstrap)
-	// {
-	// 	RegisterTimeout(DEADLOCK_TIMEOUT, CheckDeadLockAlert);
-	// 	RegisterTimeout(STATEMENT_TIMEOUT, StatementTimeoutHandler);
-	// 	RegisterTimeout(LOCK_TIMEOUT, LockTimeoutHandler);
-	// 	RegisterTimeout(IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
-	// 					IdleInTransactionSessionTimeoutHandler);
-	// 	RegisterTimeout(TRANSACTION_TIMEOUT, TransactionTimeoutHandler);
-	// 	RegisterTimeout(IDLE_SESSION_TIMEOUT, IdleSessionTimeoutHandler);
-	// 	RegisterTimeout(CLIENT_CONNECTION_CHECK_TIMEOUT, ClientCheckTimeoutHandler);
-	// 	RegisterTimeout(IDLE_STATS_UPDATE_TIMEOUT,
-	// 					IdleStatsUpdateTimeoutHandler);
-	// }
+	if (!bootstrap)
+	{
+		RegisterTimeout(DEADLOCK_TIMEOUT, CheckDeadLockAlert);
+		RegisterTimeout(STATEMENT_TIMEOUT, StatementTimeoutHandler);
+		RegisterTimeout(LOCK_TIMEOUT, LockTimeoutHandler);
+		RegisterTimeout(IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+						IdleInTransactionSessionTimeoutHandler);
+		RegisterTimeout(TRANSACTION_TIMEOUT, TransactionTimeoutHandler);
+		RegisterTimeout(IDLE_SESSION_TIMEOUT, IdleSessionTimeoutHandler);
+		RegisterTimeout(CLIENT_CONNECTION_CHECK_TIMEOUT, ClientCheckTimeoutHandler);
+		RegisterTimeout(IDLE_STATS_UPDATE_TIMEOUT,
+						IdleStatsUpdateTimeoutHandler);
+	}
 
 	/*
 	 * If this is either a bootstrap process or a standalone backend, start up
@@ -1678,7 +1678,8 @@ ReusePostgres(const char *in_dbname, Oid dboid,
 	 * Load relcache entries for the system catalogs.  This must create at
 	 * least the minimum set of "nailed-in" cache entries.
 	 */
-	// RelationCacheInitializePhase3();
+	// RelationCacheInitializePhase3ForReuse();
+	RelationCacheInitializePhase3();
 
 	/* set up ACL framework (so CheckMyDatabase can check permissions) */
 	initialize_acl_for_reuse();

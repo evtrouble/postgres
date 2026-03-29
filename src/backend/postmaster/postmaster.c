@@ -1877,21 +1877,7 @@ ServerLoop(void)
 						
 						if (idle_backend != NULL)
 						{
-							PGPROC *proc = BackendPidGetProc(idle_backend->pid);
-							idle_backend->procLatch = proc ? &proc->procLatch : NULL;
-							/*
-							 * The procLatch should have been set when the backend was
-							 * created in BackendStartup(). If it's NULL, something went
-							 * wrong (backend exited or hasn't initialized yet), so we
-							 * fall back to creating a new backend.
-							 */
-							if (idle_backend->procLatch == NULL)
-							{
-								elog(DEBUG2, "backend (pid=%d) procLatch not available, creating new backend",
-									 (int) idle_backend->pid);
-								/* Fall through to create new backend */
-							}
-							else if (send_socket_to_backend(idle_backend, &s))
+							if (send_socket_to_backend(idle_backend, &s))
 							{
 								if (got_target_db)
 								{
@@ -1904,9 +1890,9 @@ ServerLoop(void)
 										(int) idle_backend->pid);
 									
 								/*
-									* We no longer need the socket in this process.
-									* The backend now owns it.
-									*/
+								 * We no longer need the socket in this process.
+								 * The backend now owns it.
+								 */
 								if (s.sock != PGINVALID_SOCKET)
 								{
 									if (closesocket(s.sock) != 0)

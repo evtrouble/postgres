@@ -97,10 +97,13 @@ send_socket_to_backend(PMChild *pmchild, ClientSocket *client_sock)
     memcpy(CMSG_DATA(cmsg), &client_sock->sock, sizeof(int));
 
     /* 发送：同时传递 fd + 客户端地址 */
-    // elog(DEBUG1, "sending raddr size = %zu, fd = %d", 
-    //  sizeof(client_sock->raddr), client_sock->sock);
-    sent = sendmsg(pmchild->control_fd, &msg, 0);
-    // elog(DEBUG1, "sendmsg returned %zd", sent);
+    sent = sendmsg(pmchild->control_fd, &msg,
+#ifdef MSG_NOSIGNAL
+                   MSG_NOSIGNAL
+#else
+                   0
+#endif
+    );
     if (sent != sizeof(client_sock->raddr))
     {
         int save_errno = errno;
@@ -113,12 +116,14 @@ send_socket_to_backend(PMChild *pmchild, ClientSocket *client_sock)
         /* 如果对端已关闭，可能是 backend 退出了 */
         if (save_errno == EPIPE || save_errno == ECONNRESET)
             elog(DEBUG2, "backend (pid=%d) control channel closed", (int)pmchild->pid);
+        else if (save_errno == ENOTSOCK)
+            elog(DEBUG2, "sendmsg reported ENOTSOCK on control channel (pid=%d)", (int)pmchild->pid);
 
         return false;
     }
 
-    /* 唤醒 backend */
-    SetLatch(pmchild->procLatch);
+    /* 唤醒 backend：通过信号让后端在信号处理器中自设 Latch */
+    (void) kill(pmchild->pid, SIGUSR1);
 
     elog(DEBUG2, "sent client socket (fd=%d) to backend (pid=%d)",
          (int)client_sock->sock, (int)pmchild->pid);
@@ -200,6 +205,7 @@ receive_socket_from_postmaster(ClientSocket *cs)
                 elog(WARNING, "accept on control socket failed: %m");
                 continue;
             }
+            elog(DEBUG2, "accepted control connection from postmaster");
         }
 
 		cs->sock = PGINVALID_SOCKET;

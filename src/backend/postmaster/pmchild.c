@@ -156,7 +156,6 @@ InitPostmasterChildSlots(void)
 			slots[slotno].bkend_type = B_INVALID;
 			slots[slotno].rw = NULL;
 			slots[slotno].bgworker_notify = false;
-			slots[slotno].procLatch = NULL;
 			slots[slotno].control_fd = -1;
 			slots[slotno].last_dbname[0] = '\0';
 			slots[slotno].last_db_hash = 0;
@@ -196,7 +195,6 @@ AssignPostmasterChildSlot(BackendType btype)
 	pmchild->bkend_type = btype;
 	pmchild->rw = NULL;
 	pmchild->bgworker_notify = true;
-	pmchild->procLatch = NULL;	/* Will be set after backend calls InitProcess() */
 	pmchild->control_fd = -1;
 	pmchild->last_dbname[0] = '\0';
 	pmchild->last_db_hash = 0;
@@ -243,7 +241,6 @@ AllocDeadEndChild(void)
 		pmchild->bkend_type = B_DEAD_END_BACKEND;
 		pmchild->rw = NULL;
 		pmchild->bgworker_notify = false;
-		pmchild->procLatch = NULL;
 		pmchild->control_fd = -1;
 		pmchild->last_dbname[0] = '\0';
 		pmchild->last_db_hash = 0;
