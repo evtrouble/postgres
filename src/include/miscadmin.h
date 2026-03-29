@@ -196,6 +196,7 @@ extern PGDLLIMPORT int MyCancelKeyLength;
 extern PGDLLIMPORT int MyPMChildSlot;
 extern PGDLLIMPORT uintptr_t MyPMChildPtr;  /* PMChild* for connection pool (as address value) */
 extern PGDLLIMPORT bool is_reuse_cleanup;
+extern PGDLLIMPORT bool connection_pool_reuse_forbidden;
 extern PGDLLIMPORT int MyControlFd;
 extern PGDLLIMPORT int MyListenFd;
 

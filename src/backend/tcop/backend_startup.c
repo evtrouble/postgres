@@ -32,8 +32,10 @@
 #include "postmaster/connection_pool.h"
 #include "postmaster/interrupt.h"
 #include "replication/walsender.h"
+#include "storage/buf_internals.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/lock.h"
 #include "storage/procsignal.h"
 #include "storage/proc.h"
 #include "tcop/backend_startup.h"
@@ -49,6 +51,7 @@
 #include "utils/timeout.h"
 #include "utils/varlena.h"
 #include "commands/discard.h"
+#include "catalog/namespace.h"
 
 /* GUCs */
 bool		Trace_connection_negotiation = false;
@@ -79,6 +82,7 @@ extern bool IsTransactionOrTransactionBlock(void);
 extern void AbortCurrentTransaction(void);
 
 extern bool enable_connection_pool;
+extern bool connection_pool_log_memory_contexts;
 
 /*
  * ResetBackendForReuse
@@ -92,8 +96,6 @@ static void
 ResetBackendForReuse(void)
 {
 	/* Transaction cleanup */
-	ReuseProcExitCleanup();
-
 	{
 		DiscardStmt stmt;
 
@@ -110,10 +112,18 @@ ResetBackendForReuse(void)
 		CommitTransactionCommand();
 	}
 
+	ResetTempNamespaceForReuse();
+
+
 	/* Release (and warn about) any buffer pins leaked */
 	if (AuxProcessResourceOwner != NULL)
 		ReleaseAuxProcessResources(true);
 	CurrentResourceOwner = NULL;
+	CurTransactionResourceOwner = NULL;
+	TopTransactionResourceOwner = NULL;
+	ResetLocalBuffersForReuse();
+
+	ReuseProcExitCleanup();
 
 	/* Communication reset */
 	whereToSendOutput = DestNone;
@@ -164,6 +174,15 @@ ResetBackendForReuse(void)
 		pfree(ps_data.data);
 	}
 	set_ps_display("idle");
+
+	if (connection_pool_log_memory_contexts)
+	{
+		ereport(LOG_SERVER_ONLY,
+				(errhidestmt(true),
+				 errhidecontext(true),
+				 errmsg("connection pool backend reuse: logging memory contexts of PID %d", MyProcPid)));
+		MemoryContextStatsDetail(TopMemoryContext, 100, 100, false);
+	}
 }
 
 /*
@@ -255,6 +274,9 @@ BackendMain(const void *startup_data, size_t startup_data_len)
 		while(true) {
 			MultiPostgresMain(MyProcPort->database_name, MyProcPort->user_name);
 
+			if (connection_pool_reuse_forbidden)
+				proc_exit(0);
+
 			/* Clean up and prepare for reuse */
 			ResetBackendForReuse();
 
@@ -283,6 +305,8 @@ BackendInitializeForReuse(ClientSocket *client_sock)
 	int			ret;
 	int			status;
 	StringInfoData ps_data;
+
+	connection_pool_reuse_forbidden = false;
 
 	pq_reuse(client_sock);
 
@@ -493,6 +517,8 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 	char		remote_port[NI_MAXSERV];
 	StringInfoData ps_data;
 	MemoryContext oldcontext;
+
+	connection_pool_reuse_forbidden = false;
 
 	/* Tell fd.c about the long-lived FD associated with the client_sock */
 	ReserveExternalFD();

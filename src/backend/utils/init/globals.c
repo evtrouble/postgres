@@ -50,6 +50,7 @@ TimestampTz MyStartTimestamp;
 struct ClientSocket *MyClientSocket;
 struct Port *MyProcPort;
 bool is_reuse_cleanup = false;
+bool connection_pool_reuse_forbidden = false;
 uint8		MyCancelKey[MAX_CANCEL_KEY_LENGTH];
 int			MyCancelKeyLength = 0;
 int			MyPMChildSlot;

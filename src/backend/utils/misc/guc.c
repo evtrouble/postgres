@@ -5253,6 +5253,8 @@ MarkGUCPrefixReserved(const char *className)
 	GUCHashEntry *hentry;
 	MemoryContext oldcontext;
 
+	connection_pool_reuse_forbidden = true;
+
 	/*
 	 * Check for existing placeholders.  We must actually remove invalid
 	 * placeholders, else future parallel worker startups will fail.

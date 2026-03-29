@@ -844,6 +844,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			{
 				LoadStmt   *stmt = (LoadStmt *) parsetree;
 
+				connection_pool_reuse_forbidden = true;
 				closeAllVfds(); /* probably not necessary... */
 				/* Allowed names are restricted if you're not superuser */
 				load_file(stmt->filename, !superuser());
@@ -1565,14 +1566,17 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateExtensionStmt:
+				connection_pool_reuse_forbidden = true;
 				address = CreateExtension(pstate, (CreateExtensionStmt *) parsetree);
 				break;
 
 			case T_AlterExtensionStmt:
+				connection_pool_reuse_forbidden = true;
 				address = ExecAlterExtensionStmt(pstate, (AlterExtensionStmt *) parsetree);
 				break;
 
 			case T_AlterExtensionContentsStmt:
+				connection_pool_reuse_forbidden = true;
 				address = ExecAlterExtensionContentsStmt((AlterExtensionContentsStmt *) parsetree,
 														 &secondaryObject);
 				break;
