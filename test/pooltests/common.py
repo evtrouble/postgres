@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -15,6 +16,10 @@ class PoolTestContext:
         self.rss_warmup = int(os.environ.get("POOLTEST_RSS_WARMUP", "10"))
         self.mcxt_max_delta_bytes = int(os.environ.get("POOLTEST_MCXT_MAX_DELTA_BYTES", str(100 * 1024 * 1024)))
         self.mcxt_warmup = int(os.environ.get("POOLTEST_MCXT_WARMUP", str(self.rss_warmup)))
+        self.mcxt_snapshot_every = int(os.environ.get("POOLTEST_MCXT_SNAPSHOT_EVERY", "0"))
+        self.mcxt_topn = int(os.environ.get("POOLTEST_MCXT_TOPN", "10"))
+        self.rss_smaps = os.environ.get("POOLTEST_RSS_SMAPS", "0") not in ("0", "false", "False")
+        self.fd_count = os.environ.get("POOLTEST_FD_COUNT", "0") not in ("0", "false", "False")
 
     def get_psql_cmd(self):
         if "PSQL_PATH" in os.environ:
@@ -123,6 +128,104 @@ class PoolTestContext:
             return None
 
         return int(total_s), int(used_s)
+
+    def get_backend_memory_context_top(self, topn=None):
+        if topn is None:
+            topn = self.mcxt_topn
+        if topn <= 0:
+            return None
+
+        res = self.run_psql(
+            f"""
+            SELECT pg_backend_pid();
+            SELECT COALESCE(
+                jsonb_agg(
+                    jsonb_build_object('name', name, 'total', total_bytes, 'used', used_bytes)
+                    ORDER BY total_bytes DESC
+                )::text,
+                '[]'
+            )
+            FROM (
+                SELECT name,
+                       sum(total_bytes)::bigint AS total_bytes,
+                       sum(used_bytes)::bigint AS used_bytes
+                FROM pg_backend_memory_contexts
+                GROUP BY name
+                ORDER BY sum(total_bytes) DESC
+                LIMIT {int(topn)}
+            ) s;
+            """,
+            allow_error=True,
+        )
+        if res is None or res["returncode"] != 0:
+            return None
+
+        lines = (res["stdout"] or "").split("\n")
+        pid = first_nonempty_line(lines[0] if lines else "")
+        payload = first_nonempty_line(lines[1] if len(lines) > 1 else "")
+        if not pid or not pid.isdigit() or payload is None:
+            return None
+
+        try:
+            items = json.loads(payload)
+        except Exception:
+            return None
+
+        if not isinstance(items, list):
+            return None
+
+        normalized = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            name = it.get("name")
+            total = it.get("total")
+            used = it.get("used")
+            if isinstance(name, str) and isinstance(total, int) and isinstance(used, int):
+                normalized.append({"name": name, "total": total, "used": used})
+        return pid, normalized
+
+    def get_smaps_rollup_kb(self, pid):
+        wanted = {
+            "Rss": "Rss",
+            "Pss": "Pss",
+            "Shared_Clean": "Shared_Clean",
+            "Shared_Dirty": "Shared_Dirty",
+            "Private_Clean": "Private_Clean",
+            "Private_Dirty": "Private_Dirty",
+            "Swap": "Swap",
+        }
+        out = {}
+        try:
+            with open(f"/proc/{pid}/smaps_rollup", "r", encoding="utf-8") as f:
+                for line in f:
+                    if ":" not in line:
+                        continue
+                    k, rest = line.split(":", 1)
+                    k = k.strip()
+                    if k not in wanted:
+                        continue
+                    parts = rest.split()
+                    if len(parts) >= 1 and parts[0].isdigit():
+                        out[k] = int(parts[0])
+        except FileNotFoundError:
+            return None
+        except PermissionError:
+            return None
+        except Exception:
+            return None
+
+        return out or None
+
+    def get_fd_count(self, pid):
+        try:
+            return len(os.listdir(f"/proc/{pid}/fd"))
+        except FileNotFoundError:
+            return None
+        except PermissionError:
+            return None
+        except Exception:
+            return None
 
 
 def first_nonempty_line(s):

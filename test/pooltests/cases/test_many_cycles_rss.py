@@ -36,17 +36,28 @@ def run(ctx):
     pid_seen_order = []
     pid_mcxt_total_samples = {}
     pid_mcxt_used_samples = {}
+    pid_last_mcxt_top = {}
 
     cycles = ctx.cycles
     warmup = ctx.rss_warmup
     max_delta_kb = ctx.rss_max_delta_kb
     mcxt_warmup = ctx.mcxt_warmup
     mcxt_max_delta_bytes = ctx.mcxt_max_delta_bytes
+    mcxt_snapshot_every = getattr(ctx, "mcxt_snapshot_every", 0) or 0
+    mcxt_topn = getattr(ctx, "mcxt_topn", 0) or 0
+    rss_smaps = bool(getattr(ctx, "rss_smaps", False))
+    fd_count = bool(getattr(ctx, "fd_count", False))
 
     print(
         f"cycles={cycles} warmup={warmup} rss_max_delta_kb={max_delta_kb} "
         f"mcxt_warmup={mcxt_warmup} mcxt_max_delta_bytes={mcxt_max_delta_bytes}"
     )
+    if mcxt_enabled and mcxt_snapshot_every > 0 and mcxt_topn > 0:
+        print(f"mcxt_snapshot_every={mcxt_snapshot_every} mcxt_topn={mcxt_topn}")
+    if rss_smaps:
+        print("smaps_rollup: enabled")
+    if fd_count:
+        print("fd_count: enabled")
 
     for i in range(cycles):
         setup_sql = f"""
@@ -121,15 +132,48 @@ def run(ctx):
                 pid_mcxt_used_samples[pid_b].append(int(parts[1]))
 
         if (i + 1) % 10 == 0:
+            extra = ""
+            if rss_smaps:
+                smaps = ctx.get_smaps_rollup_kb(pid_b)
+                if smaps:
+                    pdirty = smaps.get("Private_Dirty")
+                    pclean = smaps.get("Private_Clean")
+                    sclean = smaps.get("Shared_Clean")
+                    sdirty = smaps.get("Shared_Dirty")
+                    extra += f" smaps_pvt={pclean or 0}+{pdirty or 0}KB smaps_shr={sclean or 0}+{sdirty or 0}KB"
+            if fd_count:
+                fds = ctx.get_fd_count(pid_b)
+                if fds is not None:
+                    extra += f" fds={fds}"
             if mcxt_enabled and pid_mcxt_total_samples.get(pid_b):
                 total_b = pid_mcxt_total_samples[pid_b][-1]
                 used_b = pid_mcxt_used_samples[pid_b][-1]
                 print(
                     f"progress: {i+1}/{cycles} pid={pid_b} rss={rss_kb}KB "
-                    f"mcxt_total={total_b} mcxt_used={used_b}"
+                    f"mcxt_total={total_b} mcxt_used={used_b}{extra}"
                 )
             else:
-                print(f"progress: {i+1}/{cycles} pid={pid_b} rss={rss_kb}KB")
+                print(f"progress: {i+1}/{cycles} pid={pid_b} rss={rss_kb}KB{extra}")
+
+            if mcxt_enabled and mcxt_snapshot_every > 0 and mcxt_topn > 0 and (i + 1) % mcxt_snapshot_every == 0:
+                top = ctx.get_backend_memory_context_top(mcxt_topn)
+                if top:
+                    snap_pid, items = top
+                    if snap_pid == pid_b and items:
+                        prev = pid_last_mcxt_top.get(pid_b) or {}
+                        curr = {it["name"]: (it["total"], it["used"]) for it in items}
+                        if prev:
+                            rows = []
+                            for name, (total, used) in curr.items():
+                                ptotal, pused = prev.get(name, (0, 0))
+                                rows.append((total - ptotal, used - pused, name, total, used))
+                            rows.sort(reverse=True)
+                            for dt, du, name, total, used in rows[:mcxt_topn]:
+                                print(f"mcxt_top: pid={pid_b} {name} total={total} used={used} d_total={dt} d_used={du}")
+                        else:
+                            for it in items:
+                                print(f"mcxt_top: pid={pid_b} {it['name']} total={it['total']} used={it['used']}")
+                        pid_last_mcxt_top[pid_b] = curr
 
         time.sleep(0.01)
 
