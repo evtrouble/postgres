@@ -4717,6 +4717,18 @@ ResetTempTableNamespace(void)
 		RemoveTempRelations(myTempNamespace);
 }
 
+void
+ResetTempNamespaceForReuse(void)
+{
+	myTempNamespace = InvalidOid;
+	myTempToastNamespace = InvalidOid;
+	myTempNamespaceSubID = InvalidSubTransactionId;
+	baseSearchPathValid = false;
+	searchPathCacheValid = false;
+	if (MyProc)
+		MyProc->tempNamespaceId = InvalidOid;
+}
+
 
 /*
  * Routines for handling the GUC variable 'search_path'.

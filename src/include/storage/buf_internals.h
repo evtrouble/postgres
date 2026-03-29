@@ -482,6 +482,7 @@ extern void DropRelationLocalBuffers(RelFileLocator rlocator,
 									 ForkNumber *forkNum, int nforks,
 									 BlockNumber *firstDelBlock);
 extern void DropRelationAllLocalBuffers(RelFileLocator rlocator);
+extern void ResetLocalBuffersForReuse(void);
 extern void AtEOXact_LocalBuffers(bool isCommit);
 
 #endif							/* BUFMGR_INTERNALS_H */

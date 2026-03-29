@@ -220,9 +220,6 @@ do { \
 		hentry->reldesc = (RELATION); \
 		if (RelationHasReferenceCountZero(_old_rel)) \
 			RelationDestroyRelation(_old_rel, false); \
-		else if (!IsBootstrapProcessingMode()) \
-			elog(WARNING, "leaking still-referenced relcache entry for \"%s\"", \
-				 RelationGetRelationName(_old_rel)); \
 	} \
 	else \
 		hentry->reldesc = (RELATION); \
@@ -283,6 +280,7 @@ static void RelationReloadIndexInfo(Relation relation);
 static void RelationReloadNailed(Relation relation);
 static void RelationFlushRelation(Relation relation);
 static void RememberToFreeTupleDescAtEOX(TupleDesc td);
+static bool RelationCacheEntryExists(Oid relid);
 #ifdef USE_ASSERT_CHECKING
 static void AssertPendingSyncConsistency(Relation relation);
 #endif
@@ -4033,6 +4031,38 @@ RelationCacheInitialize(void)
 	RelationMapInitialize();
 }
 
+void
+RelationCacheInitializeForReuse(void)
+{
+	// int			allocsize;
+
+	// if (!CacheMemoryContext)
+	// 	CreateCacheMemoryContext();
+
+	// if (RelationIdCache == NULL)
+	// {
+	// 	RelationCacheInitialize();
+	// 	return;
+	// }
+
+	// RelationMapInitialize();
+	// RelationCacheInvalidate(false);
+
+	// criticalRelcachesBuilt = false;
+	// criticalSharedRelcachesBuilt = false;
+	// relcacheInvalsReceived = 0;
+	// in_progress_list_len = 0;
+
+	// if (in_progress_list == NULL)
+	// {
+	// 	allocsize = 4;
+	// 	in_progress_list =
+	// 		MemoryContextAlloc(CacheMemoryContext,
+	// 						   allocsize * sizeof(*in_progress_list));
+	// 	in_progress_list_maxlen = allocsize;
+	// }
+}
+
 /*
  *		RelationCacheInitializePhase2
  *
@@ -4087,6 +4117,15 @@ RelationCacheInitializePhase2(void)
 	}
 
 	MemoryContextSwitchTo(oldcxt);
+}
+
+static bool
+RelationCacheEntryExists(Oid relid)
+{
+	Relation	relation;
+
+	RelationIdCacheLookup(relid, relation);
+	return RelationIsValid(relation);
 }
 
 /*
@@ -4379,6 +4418,175 @@ RelationCacheInitializePhase3(void)
 		/* now write the files */
 		write_relcache_init_file(true);
 		write_relcache_init_file(false);
+	}
+}
+
+void
+RelationCacheInitializePhase3ForReuse(void)
+{
+	HASH_SEQ_STATUS status;
+	RelIdCacheEnt *idhentry;
+	MemoryContext oldcxt;
+
+	RelationMapInitializePhase3();
+
+	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+
+	if (IsBootstrapProcessingMode())
+	{
+		MemoryContextSwitchTo(oldcxt);
+		return;
+	}
+
+	if (!RelationCacheEntryExists(DatabaseRelationId))
+		formrdesc("pg_database", DatabaseRelation_Rowtype_Id, true,
+				  Natts_pg_database, Desc_pg_database);
+	if (!RelationCacheEntryExists(AuthIdRelationId))
+		formrdesc("pg_authid", AuthIdRelation_Rowtype_Id, true,
+				  Natts_pg_authid, Desc_pg_authid);
+	if (!RelationCacheEntryExists(AuthMemRelationId))
+		formrdesc("pg_auth_members", AuthMemRelation_Rowtype_Id, true,
+				  Natts_pg_auth_members, Desc_pg_auth_members);
+	if (!RelationCacheEntryExists(SharedSecLabelRelationId))
+		formrdesc("pg_shseclabel", SharedSecLabelRelation_Rowtype_Id, true,
+				  Natts_pg_shseclabel, Desc_pg_shseclabel);
+	if (!RelationCacheEntryExists(SubscriptionRelationId))
+		formrdesc("pg_subscription", SubscriptionRelation_Rowtype_Id, true,
+				  Natts_pg_subscription, Desc_pg_subscription);
+
+	if (!RelationCacheEntryExists(RelationRelationId))
+		formrdesc("pg_class", RelationRelation_Rowtype_Id, false,
+				  Natts_pg_class, Desc_pg_class);
+	if (!RelationCacheEntryExists(AttributeRelationId))
+		formrdesc("pg_attribute", AttributeRelation_Rowtype_Id, false,
+				  Natts_pg_attribute, Desc_pg_attribute);
+	if (!RelationCacheEntryExists(ProcedureRelationId))
+		formrdesc("pg_proc", ProcedureRelation_Rowtype_Id, false,
+				  Natts_pg_proc, Desc_pg_proc);
+	if (!RelationCacheEntryExists(TypeRelationId))
+		formrdesc("pg_type", TypeRelation_Rowtype_Id, false,
+				  Natts_pg_type, Desc_pg_type);
+
+	MemoryContextSwitchTo(oldcxt);
+
+	if (!criticalRelcachesBuilt)
+	{
+		if (!RelationCacheEntryExists(ClassOidIndexId))
+			load_critical_index(ClassOidIndexId, RelationRelationId);
+		if (!RelationCacheEntryExists(AttributeRelidNumIndexId))
+			load_critical_index(AttributeRelidNumIndexId, AttributeRelationId);
+		if (!RelationCacheEntryExists(IndexRelidIndexId))
+			load_critical_index(IndexRelidIndexId, IndexRelationId);
+		if (!RelationCacheEntryExists(OpclassOidIndexId))
+			load_critical_index(OpclassOidIndexId, OperatorClassRelationId);
+		if (!RelationCacheEntryExists(AccessMethodProcedureIndexId))
+			load_critical_index(AccessMethodProcedureIndexId, AccessMethodProcedureRelationId);
+		if (!RelationCacheEntryExists(RewriteRelRulenameIndexId))
+			load_critical_index(RewriteRelRulenameIndexId, RewriteRelationId);
+		if (!RelationCacheEntryExists(TriggerRelidNameIndexId))
+			load_critical_index(TriggerRelidNameIndexId, TriggerRelationId);
+
+		criticalRelcachesBuilt = true;
+	}
+
+	if (!criticalSharedRelcachesBuilt)
+	{
+		if (!RelationCacheEntryExists(DatabaseNameIndexId))
+			load_critical_index(DatabaseNameIndexId, DatabaseRelationId);
+		if (!RelationCacheEntryExists(DatabaseOidIndexId))
+			load_critical_index(DatabaseOidIndexId, DatabaseRelationId);
+		if (!RelationCacheEntryExists(AuthIdRolnameIndexId))
+			load_critical_index(AuthIdRolnameIndexId, AuthIdRelationId);
+		if (!RelationCacheEntryExists(AuthIdOidIndexId))
+			load_critical_index(AuthIdOidIndexId, AuthIdRelationId);
+		if (!RelationCacheEntryExists(AuthMemMemRoleIndexId))
+			load_critical_index(AuthMemMemRoleIndexId, AuthMemRelationId);
+		if (!RelationCacheEntryExists(SharedSecLabelObjectIndexId))
+			load_critical_index(SharedSecLabelObjectIndexId, SharedSecLabelRelationId);
+
+		criticalSharedRelcachesBuilt = true;
+	}
+
+	hash_seq_init(&status, RelationIdCache);
+
+	while ((idhentry = (RelIdCacheEnt *) hash_seq_search(&status)) != NULL)
+	{
+		Relation	relation = idhentry->reldesc;
+		bool		restart = false;
+
+		RelationIncrementReferenceCount(relation);
+
+		if (relation->rd_rel->relowner == InvalidOid)
+		{
+			HeapTuple	htup;
+			Form_pg_class relp;
+
+			htup = SearchSysCache1(RELOID,
+								   ObjectIdGetDatum(RelationGetRelid(relation)));
+			if (!HeapTupleIsValid(htup))
+				ereport(FATAL,
+						errcode(ERRCODE_UNDEFINED_OBJECT),
+						errmsg_internal("cache lookup failed for relation %u",
+										RelationGetRelid(relation)));
+			relp = (Form_pg_class) GETSTRUCT(htup);
+
+			memcpy((char *) relation->rd_rel, (char *) relp, CLASS_TUPLE_SIZE);
+
+			if (relation->rd_options)
+				pfree(relation->rd_options);
+			RelationParseRelOptions(relation, htup);
+
+			Assert(relation->rd_att->tdtypeid == relp->reltype);
+			Assert(relation->rd_att->tdtypmod == -1);
+
+			ReleaseSysCache(htup);
+
+			if (relation->rd_rel->relowner == InvalidOid)
+				elog(ERROR, "invalid relowner in pg_class entry for \"%s\"",
+					 RelationGetRelationName(relation));
+
+			restart = true;
+		}
+
+		if (relation->rd_rel->relhasrules && relation->rd_rules == NULL)
+		{
+			RelationBuildRuleLock(relation);
+			if (relation->rd_rules == NULL)
+				relation->rd_rel->relhasrules = false;
+			restart = true;
+		}
+		if (relation->rd_rel->relhastriggers && relation->trigdesc == NULL)
+		{
+			RelationBuildTriggers(relation);
+			if (relation->trigdesc == NULL)
+				relation->rd_rel->relhastriggers = false;
+			restart = true;
+		}
+
+		if (relation->rd_rel->relrowsecurity && relation->rd_rsdesc == NULL)
+		{
+			RelationBuildRowSecurity(relation);
+
+			Assert(relation->rd_rsdesc != NULL);
+			restart = true;
+		}
+
+		if (relation->rd_tableam == NULL &&
+			(RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind) || relation->rd_rel->relkind == RELKIND_SEQUENCE))
+		{
+			RelationInitTableAccessMethod(relation);
+			Assert(relation->rd_tableam != NULL);
+
+			restart = true;
+		}
+
+		RelationDecrementReferenceCount(relation);
+
+		if (restart)
+		{
+			hash_seq_term(&status);
+			hash_seq_init(&status, RelationIdCache);
+		}
 	}
 }
 

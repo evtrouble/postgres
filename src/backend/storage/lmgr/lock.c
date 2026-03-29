@@ -733,8 +733,10 @@ LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 	 */
 	if (!locallock || locallock->nLocks <= 0)
 	{
-		elog(WARNING, "you don't own a lock of type %s",
-			 lockMethodTable->lockModeNames[lockmode]);
+		ereport(WARNING,
+				(errmsg("you don't own a lock of type %s",
+						lockMethodTable->lockModeNames[lockmode]),
+				 errbacktrace()));
 		return false;
 	}
 
@@ -763,8 +765,10 @@ LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 	{
 		PROCLOCK_PRINT("LockHasWaiters: WRONGTYPE", proclock);
 		LWLockRelease(partitionLock);
-		elog(WARNING, "you don't own a lock of type %s",
-			 lockMethodTable->lockModeNames[lockmode]);
+		ereport(WARNING,
+				(errmsg("you don't own a lock of type %s",
+						lockMethodTable->lockModeNames[lockmode]),
+				 errbacktrace()));
 		RemoveLocalLock(locallock);
 		return false;
 	}
@@ -2139,8 +2143,10 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 	 */
 	if (!locallock || locallock->nLocks <= 0)
 	{
-		elog(WARNING, "you don't own a lock of type %s",
-			 lockMethodTable->lockModeNames[lockmode]);
+		ereport(WARNING,
+				(errmsg("you don't own a lock of type %s",
+						lockMethodTable->lockModeNames[lockmode]),
+				 errbacktrace()));
 		return false;
 	}
 
@@ -2178,8 +2184,10 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 		if (i < 0)
 		{
 			/* don't release a lock belonging to another owner */
-			elog(WARNING, "you don't own a lock of type %s",
-				 lockMethodTable->lockModeNames[lockmode]);
+			ereport(WARNING,
+					(errmsg("you don't own a lock of type %s",
+							lockMethodTable->lockModeNames[lockmode]),
+					 errbacktrace()));
 			return false;
 		}
 	}

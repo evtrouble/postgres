@@ -104,8 +104,10 @@ extern int	errtableconstraint(Relation rel, const char *conname);
  * Routines for backend startup
  */
 extern void RelationCacheInitialize(void);
+extern void RelationCacheInitializeForReuse(void);
 extern void RelationCacheInitializePhase2(void);
 extern void RelationCacheInitializePhase3(void);
+extern void RelationCacheInitializePhase3ForReuse(void);
 
 /*
  * Routine to create a relcache entry for an about-to-be-created relation
