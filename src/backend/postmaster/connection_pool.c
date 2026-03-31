@@ -61,30 +61,41 @@
 #include "storage/shmem.h"
 #include "port/atomics.h"
 #include "utils/timestamp.h"
+#include "utils/lsyscache.h"
+#include "common/hashfn.h"
 #include "miscadmin.h"
+
+#define POOL_MAX_DATABASES 128
+
+typedef struct DbPoolQueue
+{
+	pg_atomic_uint64 db_hash;
+	char		dbname[NAMEDATALEN];
+	LockFreeSlotQueue queue;
+} DbPoolQueue;
 
 /*
  * Connection pool shared memory structure
  */
 typedef struct ConnectionPoolShmem
 {
-	LockFreeSlotQueue *queue;		/* Lock-free queue for slot entries */
+	DbPoolQueue *db_queues;
 	int			max_pool_size;		/* Maximum pool size (from GUC) */
 	int			current_pool_size;	/* Current number of backends in pool */
 	int			idle_timeout;		/* Idle timeout in seconds (from GUC) */
 	int			min_idle_size;		/* Minimum idle backends to keep */
+	int			max_databases;
+	uint32		per_db_queue_capacity;
 } ConnectionPoolShmem;
 
 /* Pointer to shared memory structure */
 static ConnectionPoolShmem *pool_shmem = NULL;
 
-/* Timeout tracking for dynamic pool shrinking (postmaster process only, not shared) */
-static int timeout_count = 0;				/* Consecutive timeout checks for queue head */
-
 /* GUC variables - accessed directly */
 extern int connection_pool_size;
 extern int connection_pool_idle_timeout;
 extern int connection_pool_min_idle_size;
+extern int connection_pool_db_num;
 
 /*
  * Calculate shared memory size needed for connection pool
@@ -95,29 +106,33 @@ Size
 ConnectionPoolShmemSize(void)
 {
 	Size		size;
-	Size		queue_size;
-	uint32		queue_capacity;
+	Size		qsize;
+	uint32		per_db_capacity;
+	uint32		max_dbs;
+	int			max_pool;
 	
 	/* Size of ConnectionPoolShmem structure */
 	size = sizeof(ConnectionPoolShmem);
 	
-	/* Queue capacity equals MaxBackends
-	 * MaxBackends should be initialized by InitializeMaxBackends() before
-	 * this function is called.
-	 */
-	if (MaxBackends <= 0)
-		elog(ERROR, "MaxBackends not initialized");
+	max_pool = connection_pool_size;
+	if (max_pool <= 0)
+		max_pool = 1;
+	if (max_pool > 65536)
+		max_pool = 65536;
 	
-	/* Use MaxBackends directly as queue capacity */
-	queue_capacity = (uint32) MaxBackends;
+	max_dbs = connection_pool_db_num;
+	if (max_dbs <= 0)
+		max_dbs = 1;
+	if (max_dbs > POOL_MAX_DATABASES)
+		max_dbs = POOL_MAX_DATABASES;
 	
-	/* Size of LockFreeSlotQueue structure */
-	queue_size = sizeof(LockFreeSlotQueue);
-	size = add_size(size, queue_size);
+	per_db_capacity = (uint32) max_pool;
 	
-	/* Size of queue entries array */
-	queue_size = queue_capacity * sizeof(PoolSlotEntry);
-	size = add_size(size, queue_size);
+	qsize = sizeof(DbPoolQueue) * max_dbs;
+	size = add_size(size, qsize);
+	
+	qsize = (Size) max_dbs * (Size) per_db_capacity * sizeof(PoolSlotEntry);
+	size = add_size(size, qsize);
 	return size;
 }
 
@@ -128,11 +143,13 @@ void
 ConnectionPoolShmemInit(void)
 {
 	bool		found;
-	bool		queue_found;
-	bool		entries_found;
-	Size		queue_size;
-	Size		entries_size;
-	uint32		queue_capacity;
+	bool		db_queues_found;
+	bool		db_entries_found;
+	Size		qsize;
+	Size		esize;
+	uint32		per_db_capacity;
+	uint32		max_dbs;
+	int			max_pool;
 	
 	/* Allocate shared memory structure */
 	pool_shmem = (ConnectionPoolShmem *)
@@ -145,45 +162,55 @@ ConnectionPoolShmemInit(void)
 		pool_shmem->current_pool_size = 0;
 		pool_shmem->idle_timeout = connection_pool_idle_timeout;
 		pool_shmem->min_idle_size = connection_pool_min_idle_size;
+		pool_shmem->max_databases = POOL_MAX_DATABASES;
 	}
 	
-	/* Calculate queue capacity using the same formula as ConnectionPoolShmemSize()
-	 * This ensures consistency between size calculation and initialization
-	 * Queue capacity equals MaxBackends
-	 */
-	if (MaxBackends <= 0)
-		elog(ERROR, "MaxBackends not initialized");
+	max_pool = connection_pool_size;
+	if (max_pool <= 0)
+		max_pool = 1;
+	if (max_pool > 65536)
+		max_pool = 65536;
 	
-	/* Use MaxBackends directly as queue capacity */
-	queue_capacity = (uint32) MaxBackends;
+	max_dbs = connection_pool_db_num;
+	if (max_dbs <= 0)
+		max_dbs = 1;
+	if (max_dbs > POOL_MAX_DATABASES)
+		max_dbs = POOL_MAX_DATABASES;
 	
-	/* Allocate queue structure in shared memory */
-	queue_size = sizeof(LockFreeSlotQueue);
-	pool_shmem->queue = (LockFreeSlotQueue *)
-		ShmemInitStruct("Connection Pool Queue", queue_size, &queue_found);
+	per_db_capacity = (uint32) max_pool;
+	pool_shmem->max_databases = max_dbs;
 	
-	/* Allocate queue entries array in shared memory */
+	qsize = sizeof(DbPoolQueue) * max_dbs;
+	pool_shmem->db_queues = (DbPoolQueue *)
+		ShmemInitStruct("Connection Pool DB Queues", qsize, &db_queues_found);
+	
 	{
-		PoolSlotEntry *queue_entries;
+		PoolSlotEntry *db_entries;
 		
-		entries_size = queue_capacity * sizeof(PoolSlotEntry);
-		queue_entries = (PoolSlotEntry *)
-			ShmemInitStruct("Connection Pool Queue Entries", entries_size, &entries_found);
+		esize = (Size) max_dbs * (Size) per_db_capacity * sizeof(PoolSlotEntry);
+		db_entries = (PoolSlotEntry *)
+			ShmemInitStruct("Connection Pool DB Queue Entries", esize, &db_entries_found);
 		
-		if (!queue_found && !entries_found)
+		if (!db_queues_found && !db_entries_found)
 		{
-			/* Initialize queue */
-			if (!LockFreeSlotQueueInit(pool_shmem->queue, queue_capacity, queue_entries))
+			for (uint32 i = 0; i < max_dbs; i++)
 			{
-				elog(ERROR, "failed to initialize connection pool queue");
+				DbPoolQueue *dbq = &pool_shmem->db_queues[i];
+				PoolSlotEntry *entries = db_entries + (Size) i * per_db_capacity;
+				
+				pg_atomic_init_u64(&dbq->db_hash, 0);
+				dbq->dbname[0] = '\0';
+				if (!LockFreeSlotQueueInit(&dbq->queue,
+										   per_db_capacity,
+										   entries))
+					elog(ERROR, "failed to initialize per-database connection pool queue");
 			}
 		}
 		else
 		{
-			/* Queue already exists, verify capacity matches */
-			if (pool_shmem->queue->capacity != queue_capacity)
-				elog(WARNING, "connection pool queue capacity mismatch: expected %u, got %u",
-					 queue_capacity, pool_shmem->queue->capacity);
+			if (pool_shmem->per_db_queue_capacity != per_db_capacity)
+				elog(WARNING, "connection pool per-db queue capacity mismatch: expected %u, got %u",
+					 per_db_capacity, pool_shmem->per_db_queue_capacity);
 		}
 	}
 }
@@ -246,21 +273,99 @@ bool
 PoolEnqueuePMChild(uintptr_t pmchild_ptr)
 {
 	TimestampTz idle_since;
+	DbPoolQueue *db_queues;
+	uint32		max_dbs;
+	uint64		db_hash;
+	char		dbname_trunc[NAMEDATALEN];
+	const char *dbname_src;
+	Size		dbname_len;
+	int			free_index = -1;
 	
-	if (pool_shmem == NULL || pool_shmem->queue == NULL)
+	if (pool_shmem == NULL || pool_shmem->db_queues == NULL)
 		return false;
 	
 	if (pmchild_ptr == 0)
 		return false;
 	
-	/* Get current timestamp when backend becomes idle */
+	if (MyProcPort == NULL || MyProcPort->database_name == NULL)
+		return false;
+	
+	dbname_trunc[0] = '\0';
+	dbname_src = MyProcPort->database_name;
+	strlcpy(dbname_trunc, dbname_src, sizeof(dbname_trunc));
+	dbname_len = strlen(dbname_trunc);
+	if (dbname_len == 0)
+		return false;
+	db_hash = hash_bytes_extended((const unsigned char *) dbname_trunc,
+								  (int) dbname_len,
+								  0);
+	if (db_hash == 0)
+		return false;
+	
 	idle_since = GetCurrentTimestamp();
 	
-	/* Use the lock-free queue API */
-	return LockFreeSlotQueueEnqueue(pool_shmem->queue,
-									pmchild_ptr,
-									idle_since,
-									pool_shmem->max_pool_size);
+	db_queues = pool_shmem->db_queues;
+	max_dbs = (uint32) pool_shmem->max_databases;
+	
+	for (uint32 i = 0; i < max_dbs; i++)
+	{
+		DbPoolQueue *dbq = &db_queues[i];
+		uint64		cur_hash;
+		
+		cur_hash = pg_atomic_read_u64(&dbq->db_hash);
+		if (cur_hash == 0)
+		{
+			if (free_index < 0)
+				free_index = (int) i;
+			continue;
+		}
+		
+		if (cur_hash == db_hash &&
+			strcmp(dbq->dbname, dbname_trunc) == 0)
+		{
+			return LockFreeSlotQueueEnqueue(&dbq->queue,
+											pmchild_ptr,
+											idle_since,
+											pool_shmem->max_pool_size);
+		}
+	}
+	
+	if (free_index >= 0)
+	{
+		DbPoolQueue *dbq = &db_queues[free_index];
+		uint64		expected = 0;
+		
+		if (pg_atomic_compare_exchange_u64(&dbq->db_hash, &expected, db_hash) ||
+			(expected == db_hash &&
+			 strcmp(dbq->dbname, dbname_trunc) == 0))
+		{
+			if (expected == 0)
+				strlcpy(dbq->dbname, dbname_trunc, sizeof(dbq->dbname));
+			
+			return LockFreeSlotQueueEnqueue(&dbq->queue,
+											pmchild_ptr,
+											idle_since,
+											pool_shmem->max_pool_size);
+		}
+		
+		for (uint32 i = 0; i < max_dbs; i++)
+		{
+			DbPoolQueue *dbq2 = &db_queues[i];
+			uint64		cur_hash;
+			
+			cur_hash = pg_atomic_read_u64(&dbq2->db_hash);
+			if (cur_hash == db_hash &&
+				strcmp(dbq2->dbname, dbname_trunc) == 0)
+			{
+				return LockFreeSlotQueueEnqueue(&dbq2->queue,
+												pmchild_ptr,
+												idle_since,
+												pool_shmem->max_pool_size);
+			}
+		}
+	}
+	
+	return false;
 }
 
 /*
@@ -322,62 +427,68 @@ SignalBackendToExit(PMChild *pmchild)
 PMChild *
 PoolGetIdleBackend(void)
 {
-	if (pool_shmem == NULL || pool_shmem->queue == NULL)
+	if (pool_shmem == NULL || pool_shmem->db_queues == NULL)
 		return NULL;
 	
-	/* Simply dequeue from the queue */
-	return LockFreeSlotQueueDequeue(pool_shmem->queue, NULL);
+	for (int i = 0; i < pool_shmem->max_databases; i++)
+	{
+		DbPoolQueue *dbq = &pool_shmem->db_queues[i];
+		PMChild    *pmchild;
+		uint64		cur_hash;
+		
+		cur_hash = pg_atomic_read_u64(&dbq->db_hash);
+		if (cur_hash == 0)
+			continue;
+		
+		pmchild = LockFreeSlotQueueDequeue(&dbq->queue, NULL);
+		if (pmchild != NULL)
+			return pmchild;
+	}
+	
+	return NULL;
 }
 
 PMChild *
 PoolGetIdleBackendByDbName(const char *dbname, uint64 db_hash)
 {
-	LockFreeSlotQueue *queue;
-	PMChild	   *pmchild = NULL;
-	uint64		head;
-	uint64		tail;
-	uint32		scan_count;
+	DbPoolQueue *db_queues;
+	int			free_index = -1;
 
-	if (pool_shmem == NULL || pool_shmem->queue == NULL)
+	if (pool_shmem == NULL || pool_shmem->db_queues == NULL)
 		return NULL;
 
-	queue = pool_shmem->queue;
+	db_queues = pool_shmem->db_queues;
 
 	if (dbname == NULL || dbname[0] == '\0' || db_hash == 0)
 		return NULL;
 
-	head = pg_atomic_read_u64(&queue->head);
-	tail = pg_atomic_read_u64(&queue->tail);
-
-	if (tail <= head)
-		scan_count = 0;
-	else
+	for (int i = 0; i < pool_shmem->max_databases; i++)
 	{
-		uint64 avail = tail - head;
-		if (avail > queue->capacity)
-			avail = queue->capacity;
-		scan_count = (uint32) avail;
+		DbPoolQueue *dbq = &db_queues[i];
+		uint64		cur_hash;
+		
+		cur_hash = pg_atomic_read_u64(&dbq->db_hash);
+		if (cur_hash == db_hash &&
+			strcmp(dbq->dbname, dbname) == 0)
+		{
+			return LockFreeSlotQueueDequeue(&dbq->queue, NULL);
+		}
+		if (cur_hash == 0 && free_index < 0)
+			free_index = i;
 	}
 
-	if (scan_count == 0)
-		return NULL;
-
-	for (uint32 i = 0; i < scan_count; i++)
+	if (free_index >= 0)
 	{
-		TimestampTz idle_since;
-
-		pmchild = LockFreeSlotQueueDequeue(queue, &idle_since);
-		if (pmchild == NULL)
-			break;
-
-		if (pmchild->last_db_hash == db_hash && strcmp(pmchild->last_dbname, dbname) == 0)
-			return pmchild;
-
-		if (!LockFreeSlotQueueEnqueue(queue,
-									  (uintptr_t) pmchild,
-									  idle_since,
-									  pool_shmem->max_pool_size))
-			SignalBackendToExit(pmchild);
+		DbPoolQueue *dbq = &db_queues[free_index];
+		uint64		expected = 0;
+		
+		if (pg_atomic_compare_exchange_u64(&dbq->db_hash, &expected, db_hash) ||
+			(expected == db_hash &&
+			 strcmp(dbq->dbname, dbname) == 0))
+		{
+			if (expected == 0)
+				strlcpy(dbq->dbname, dbname, sizeof(dbq->dbname));
+		}
 	}
 
 	return NULL;
@@ -398,7 +509,6 @@ PoolGetIdleBackendByDbName(const char *dbname, uint64 db_hash)
 void
 PoolCleanupExpired(void)
 {
-	LockFreeSlotQueue *queue;
 	uint64		head;
 	uint64		tail;
 	int			idle_count = 0;
@@ -406,12 +516,10 @@ PoolCleanupExpired(void)
 	TimestampTz now;
 	TimestampTz idle_since;
 	PMChild    *pmchild;
-	const int	timeout_threshold = 3; /* Remove after 3 consecutive timeout checks */
+	LockFreeSlotQueue *queue = NULL;
 	
-	if (pool_shmem == NULL || pool_shmem->queue == NULL)
+	if (pool_shmem == NULL || pool_shmem->db_queues == NULL)
 		return;
-
-	queue = pool_shmem->queue;
 	
 	if (pool_shmem->idle_timeout <= 0)
 		return; /* Timeout disabled */
@@ -422,72 +530,67 @@ PoolCleanupExpired(void)
 	if (min_idle_size > pool_shmem->max_pool_size)
 		min_idle_size = pool_shmem->max_pool_size;
 
-	head = pg_atomic_read_u64(&queue->head);
-	tail = pg_atomic_read_u64(&queue->tail);
-	if (tail > head)
+	for (int i = 0; i < pool_shmem->max_databases; i++)
 	{
-		uint64 avail = tail - head;
-		if (avail > queue->capacity)
-			avail = queue->capacity;
-		idle_count = (int) avail;
+		DbPoolQueue *dbq = &pool_shmem->db_queues[i];
+		LockFreeSlotQueue *q = &dbq->queue;
+		uint64		cur_hash;
+		
+		cur_hash = pg_atomic_read_u64(&dbq->db_hash);
+		if (cur_hash == 0)
+			continue;
+		
+		head = pg_atomic_read_u64(&q->head);
+		tail = pg_atomic_read_u64(&q->tail);
+		if (tail > head)
+		{
+			uint64 avail = tail - head;
+			if (avail > q->capacity)
+				avail = q->capacity;
+			idle_count += (int) avail;
+		}
 	}
 
 	if (idle_count <= min_idle_size)
 	{
-		timeout_count = 0;
 		return;
 	}
 	
 	now = GetCurrentTimestamp();
 	
-	/* Peek at the first entry in the queue (without dequeuing) */
-	pmchild = LockFreeSlotQueuePeek(pool_shmem->queue, &idle_since);
-	if (pmchild == NULL)
+	for (int i = 0; i < pool_shmem->max_databases; i++)
 	{
-		/* Queue is empty, reset timeout tracking */
-		timeout_count = 0;
+		DbPoolQueue *dbq = &pool_shmem->db_queues[i];
+		uint64		cur_hash;
+		
+		cur_hash = pg_atomic_read_u64(&dbq->db_hash);
+		if (cur_hash == 0)
+			continue;
+		
+		pmchild = LockFreeSlotQueuePeek(&dbq->queue, &idle_since);
+		if (pmchild != NULL &&
+			idle_since > 0 &&
+			TimestampDifferenceExceedsSeconds(idle_since, now, pool_shmem->idle_timeout))
+		{
+			queue = &dbq->queue;
+			break;
+		}
+	}
+	if (pmchild == NULL || queue == NULL)
+	{
 		return;
 	}
 	
-	/* Check if this backend has been idle too long */
-	if (idle_since > 0 &&
-		TimestampDifferenceExceedsSeconds(idle_since, now, pool_shmem->idle_timeout))
-	{
-		/* Backend is expired, increment timeout counter */
-		timeout_count++;
-		
-		elog(DEBUG2, "backend (pid=%d, slot=%d) expired check #%d (idle %ld seconds)",
-			 (int) pmchild->pid, pmchild->child_slot, timeout_count,
-			 (long) TimestampDifferenceMilliseconds(idle_since, now) / 1000);
-		
-		/* If threshold reached, remove this backend */
-		if (timeout_count >= timeout_threshold)
-		{
-			/* Dequeue the entry (remove from queue) */
-			PMChild *dequeued = LockFreeSlotQueueDequeue(pool_shmem->queue, NULL);
-			
-			/* Verify we got the same backend */
-			if (dequeued == pmchild)
-			{
-				/* Send exit signal to the backend */
-				SignalBackendToExit(pmchild);
+	pmchild = LockFreeSlotQueueDequeue(queue, NULL);
+	if (pmchild == NULL)
+		return;
 
-				elog(LOG, "removed expired backend (pid=%d, slot=%d) from connection pool "
-					 "(idle %ld seconds, %d consecutive timeout checks)",
-					 (int) pmchild->pid, pmchild->child_slot,
-					 (long) TimestampDifferenceMilliseconds(idle_since, now) / 1000,
-					 timeout_count);
-			}
-			
-			/* Reset timeout tracking */
-			timeout_count = 0;
-		}
-	}
-	else
-	{
-		/* Backend is not expired, reset timeout counter */
-		timeout_count = 0;
-	}
+	SignalBackendToExit(pmchild);
+
+	elog(LOG, "removed expired backend (pid=%d, slot=%d) from connection pool "
+			 "(idle %ld seconds)",
+			 (int) pmchild->pid, pmchild->child_slot,
+			 (long) TimestampDifferenceMilliseconds(idle_since, now) / 1000);
 }
 
 /*
@@ -496,7 +599,6 @@ PoolCleanupExpired(void)
 void
 PoolGetStats(int *current_size, int *max_size, int *idle_count)
 {
-	LockFreeSlotQueue *queue;
 	uint64		head;
 	uint64		tail;
 	int			count = 0;
@@ -511,18 +613,27 @@ PoolGetStats(int *current_size, int *max_size, int *idle_count)
 	
 	*max_size = pool_shmem->max_pool_size;
 	
-	/* Count items in queue */
-	if (pool_shmem->queue != NULL)
+	if (pool_shmem->db_queues != NULL)
 	{
-		queue = pool_shmem->queue;
-		head = pg_atomic_read_u64(&queue->head);
-		tail = pg_atomic_read_u64(&queue->tail);
-		if (tail > head)
+		for (int i = 0; i < pool_shmem->max_databases; i++)
 		{
-			uint64 avail = tail - head;
-			if (avail > queue->capacity)
-				avail = queue->capacity;
-			count = (int) avail;
+			DbPoolQueue *dbq = &pool_shmem->db_queues[i];
+			LockFreeSlotQueue *queue = &dbq->queue;
+			uint64		cur_hash;
+			
+			cur_hash = pg_atomic_read_u64(&dbq->db_hash);
+			if (cur_hash == 0)
+				continue;
+			
+			head = pg_atomic_read_u64(&queue->head);
+			tail = pg_atomic_read_u64(&queue->tail);
+			if (tail > head)
+			{
+				uint64 avail = tail - head;
+				if (avail > queue->capacity)
+					avail = queue->capacity;
+				count += (int) avail;
+			}
 		}
 	}
 	

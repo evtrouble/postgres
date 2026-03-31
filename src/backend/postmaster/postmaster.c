@@ -1874,7 +1874,8 @@ ServerLoop(void)
 							idle_backend = PoolGetIdleBackendByDbName(target_dbname, db_hash);
 						else
 							idle_backend = PoolGetIdleBackend();
-						
+						elog(DEBUG2, "found idle backend (pid=%p)",
+								idle_backend);
 						if (idle_backend != NULL)
 						{
 							if (send_socket_to_backend(idle_backend, &s))

@@ -165,15 +165,25 @@ ResetBackendForReuse(void)
 
 	/* Reset memory contexts used per-connection (handled by exit callbacks) */
 
-	/* Update ps display */
-	if (MyProcPort)
+	if (MyProcPort && MyProcPort->database_name)
 	{
-		StringInfoData ps_data;
-		initStringInfo(&ps_data);
-		init_ps_display(ps_data.data);
-		pfree(ps_data.data);
+		StringInfoData ps_prefix;
+
+		initStringInfo(&ps_prefix);
+		init_ps_display(ps_prefix.data);
+		pfree(ps_prefix.data);
+
+		StringInfoData ps_activity;
+
+		initStringInfo(&ps_activity);
+		appendStringInfo(&ps_activity, "idle %s", MyProcPort->database_name);
+		set_ps_display(ps_activity.data);
+		pfree(ps_activity.data);
 	}
-	set_ps_display("idle");
+	else
+	{
+		set_ps_display(" idle");
+	}
 
 	if (connection_pool_log_memory_contexts)
 	{

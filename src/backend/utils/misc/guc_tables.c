@@ -534,6 +534,7 @@ bool		connection_pool_log_memory_contexts = false;
 int			connection_pool_size = 10;
 int			connection_pool_idle_timeout = 300;	/* seconds */
 int			connection_pool_min_idle_size = 0;
+int			connection_pool_db_num = 16;
 char	   *connection_pool_socket_dir;
 char	   *connection_pool_socket_file_prefix;
 

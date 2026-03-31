@@ -1105,7 +1105,7 @@
   short_desc => 'Sets the maximum number of backend processes in the connection pool.',
   long_desc => 'This parameter can be changed at runtime by reloading the configuration file. Changes take effect immediately for new connections.',
   variable => 'connection_pool_size',
-  boot_val => '80',
+  boot_val => '32',
   min => '1',
   max => 'MAX_BACKENDS',
 },
