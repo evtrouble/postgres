@@ -204,6 +204,17 @@ static Oid	myTempToastNamespace = InvalidOid;
 static SubTransactionId myTempNamespaceSubID = InvalidSubTransactionId;
 
 /*
+ * True once we've registered the before_shmem_exit callback used to clean up
+ * temp relations at backend exit.
+ *
+ * In a connection-pool reuse model, a backend can serve multiple sessions.
+ * If the temp namespace is reset between sessions, it may be recreated and
+ * committed multiple times. We must avoid registering the same callback over
+ * and over, otherwise we can exhaust before_shmem_exit slots.
+ */
+static bool tempRelationsExitRegistered = false;
+
+/*
  * This is the user's textual search path specification --- it's the value
  * of the GUC variable 'search_path'.
  */
@@ -4592,7 +4603,13 @@ AtEOXact_Namespace(bool isCommit, bool parallel)
 	if (myTempNamespaceSubID != InvalidSubTransactionId && !parallel)
 	{
 		if (isCommit)
-			before_shmem_exit(RemoveTempRelationsCallback, 0);
+		{
+			if (!tempRelationsExitRegistered)
+			{
+				before_shmem_exit(RemoveTempRelationsCallback, 0);
+				tempRelationsExitRegistered = true;
+			}
+		}
 		else
 		{
 			myTempNamespace = InvalidOid;
