@@ -52,11 +52,16 @@ test_many_cycles_rss.py: 通过
 ```
 若某个用例失败，会显示具体错误信息。
 ### 1.4 重要说明
-- 不能直接运行 pooltests/cases/ 下的单个用例文件，因为它们仅定义 run(ctx) 函数，没有入口。必须通过 test_pool.py 或 pooltests/runner.py 执行。
 
-- 测试会自动创建临时数据库 pooltest_db，结束后自动清理。
-
-- test_many_cycles_rss.py 运行时间较长，用于检测内存泄漏。注意：该测试依赖连接池复用后端进程；如果复用逻辑未能保持同一进程（例如因并发调度导致新建后端），可能导致 RSS 波动被误判为泄漏。若该用例偶发失败，可适当放宽内存阈值或增加循环次数重试。
+- **不能直接运行 `pooltests/cases/` 下的单个用例文件**，因为它们仅定义 `run(ctx)` 函数，没有入口。必须通过 `test_pool.py` 或 `pooltests/runner.py` 执行。
+- 测试会自动创建临时数据库 `pooltest_db`，结束后自动清理。
+- **关于连接复用与 PID 的一致性**：所有功能测试均依赖连接池成功复用后端进程（即前后两次请求获得的 `pg_backend_pid()` 相同）。但在某些情况下（例如数据库刚启动、刚执行完 `make check`、系统负载剧烈波动等），连接池的复用逻辑可能暂时无法保持同一 PID，导致测试失败，输出类似：
+```text
+test_basic_isolation.py: 失败 1 项
+连接未复用（PID 不同）
+```
+或 `test_error_cleanup.py` 中出现 `ERROR 场景后连接未复用`。  
+**解决方法**：通常情况下，重启 PostgreSQL 服务（`pg_ctl restart`）即可恢复正常的复用行为，重新运行测试即可通过。
 
 ### 1.5 测试用例说明
 |用例文件|测试目的|
@@ -76,6 +81,7 @@ test_many_cycles_rss.py: 通过
 |Mode 2|无连接池，短连接（pgbench -C，每个事务新建连接）|
 |Mode 3|通过 pgBouncer 连接池（短连接，Unix socket）|
 |Mode 4|内置连接池（短连接，Unix socket）|
+
 所有连接均使用 Unix socket，避免高并发下 TCP 端口耗尽。默认数据库：所有性能测试均在 postgres 数据库上运行（数据初始化时会创建 pgbench 表）。
 
 ### 2.1 前置依赖
@@ -87,7 +93,7 @@ test_many_cycles_rss.py: 通过
 - 环境变量 PGDATA 已设置（例如 export PGDATA=/home/postgres/pgdata）
 - pgbench 和 psql 命令可用
 
-#### pgBouncer 配置
+### 2.2 pgBouncer 配置
 编辑 /etc/pgbouncer/pgbouncer.ini，根据测试场景选择连接池模式：
 
 事务级池
@@ -111,7 +117,7 @@ sudo systemctl restart pgbouncer
 ```
 说明：server_reset_query = DISCARD ALL 可强制重置会话状态，避免状态污染。
 
-### 2.2 只读性能测试（compare_connection_modes.sh）
+### 2.3 只读性能测试（compare_connection_modes.sh）
 该脚本执行 pgbench -S（只读查询），数据初始化一次即可。
 
 运行方式：
@@ -124,7 +130,8 @@ chmod +x compare_connection_modes.sh
 ```bash
 ./compare_connection_modes.sh --clients 8 --duration 30
 ```
-### 2.3 TPC-B 读写混合性能测试（compare_tpcb.sh）
+
+### 2.4 TPC-B 读写混合性能测试（compare_tpcb.sh）
 该脚本执行完整的 TPC-B 事务（包含 UPDATE/INSERT），每个模式测试前会重新初始化 pgbench 数据，确保公平性。
 
 运行方式：
@@ -138,7 +145,7 @@ chmod +x compare_tpcb.sh
 ./compare_tpcb.sh --clients 8 --duration 30
 ```
 
-### 2.4 输出结果
+### 2.5 输出结果
 每个测试会在当前目录生成 results_* 或 results_tpcb_* 目录，包含：
 - mode_1.txt ~ mode_4.txt：各模式的详细 pgbench 输出
 - summary.txt：汇总 TPS 和延迟
@@ -157,7 +164,7 @@ chmod +x compare_tpcb.sh
 
 ```sql
 -- 使用 ALTER SYSTEM 写入配置
-ALTER SYSTEM SET connection_pool_size = 100;
+ALTER SYSTEM SET connection_pool_size = 50;
 ALTER SYSTEM SET connection_pool_min_idle_size = 10;
 ALTER SYSTEM SET connection_pool_idle_timeout = 60;
 

@@ -5,7 +5,7 @@ RUN apt update && apt install -y \
     sudo git vim systemctl \
     gcc pkg-config libicu-dev bison flex \
     libreadline-dev zlib1g-dev make \
-    python3 python3-pip locales pgbouncer && \
+    python3 python3-pip locales && \
     # 生成 locale 
     locale-gen en_US.UTF-8 && \
     update-locale LANG=en_US.UTF-8 && \
@@ -19,6 +19,9 @@ ENV LC_ALL=en_US.UTF-8
 RUN useradd -m postgres && \
     usermod -aG sudo postgres && \
     echo "postgres ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/postgres
+
+RUN apt install -y pgbouncer
+
 WORKDIR /home/postgres
 USER postgres
 
@@ -72,5 +75,6 @@ unix_socket_dir = /var/run/postgresql
 unix_socket_mode = 0777 
 EOF
 
+USER postgres
 EXPOSE 5432
 CMD ["tail", "-f", "/dev/null"]

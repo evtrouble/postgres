@@ -36,29 +36,29 @@ sudo apt update && sudo apt install -y git gcc make pkg-config libicu-dev bison 
 sudo useradd -m postgres
 sudo passwd -d postgres   # 可选：清空密码，便于本地免密切换
 
-# 3. 克隆源码（可以放在任意目录，例如 /tmp 或当前用户目录下）
+# 3. 切换到 postgres 用户 
+sudo su - postgres
+
+# 4. 克隆源码
 git clone https://github.com/evtrouble/postgres.git -b conn_pool
 cd postgres
 
-# 4. 配置并编译（编译本身不需要 postgres 用户，但安装路径会在 postgres 的 home 下）
-#    先确保 /home/postgres 存在且后续安装时能用 sudo 改权限
+# 5. 配置并编译
 ./configure --prefix=/home/postgres/pg_install --enable-debug CFLAGS=-O0
 make -j$(nproc)
 sudo make install   # 安装到 /home/postgres/pg_install，需要 sudo 创建目录
 
-# 5. 将安装目录的所有权交给 postgres 用户
-sudo chown -R postgres:postgres /home/postgres
-
-# 6. 切换到 postgres 用户并初始化数据库
-sudo su - postgres
-initdb -D /home/postgres/pgdata --auth-local=trust --username=postgres
-
-# 7. 启动数据库
-pg_ctl -D /home/postgres/pgdata -l logfile start
-
-# 8. 配置 PATH 并登录
+# 6. 配置 PATH
 echo "export PATH=/home/postgres/pg_install/bin:\$PATH" >> ~/.bashrc
 source ~/.bashrc
+
+# 7. 初始化数据库
+initdb -D /home/postgres/pgdata --auth-local=trust --username=postgres
+
+# 8. 启动数据库
+pg_ctl -D /home/postgres/pgdata -l logfile start
+
+# 9. 登录数据库
 psql
 ```
 
